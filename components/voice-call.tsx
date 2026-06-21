@@ -4,11 +4,12 @@ import clsx from "clsx";
 import { Mic, MicOff, Phone, PhoneCall, PhoneOff, X } from "lucide-react";
 import Pusher from "pusher-js";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { playToneSequence, unlockAudio } from "@/lib/audio-client";
 import type { CallSignal, CallSignalType } from "@/lib/call";
 import { PUSHER_CHANNEL, PUSHER_EVENT_CALL_SIGNAL } from "@/lib/realtime";
 import { SENDER_LABEL, type Sender } from "@/lib/types";
 
-type CallStatus = "idle" | "calling" | "ringing" | "connecting" | "active";
+type CallStatus = "idle" | "calling" | "ringing" | "connecting" | "reconnecting" | "active";
 type RingMode = "outgoing" | "incoming";
 
 type VoiceCallProps = {
@@ -21,16 +22,26 @@ const ICE_SERVERS: RTCIceServer[] = [
   { urls: "stun:global.stun.twilio.com:3478" }
 ];
 const SIGNAL_FAST_POLLING_INTERVAL_MS = 500;
-const SIGNAL_IDLE_REALTIME_POLLING_INTERVAL_MS = 1500;
-const SIGNAL_BACKGROUND_POLLING_INTERVAL_MS = 6000;
+const SIGNAL_IDLE_FALLBACK_POLLING_INTERVAL_MS = 1000;
+const SIGNAL_IDLE_REALTIME_POLLING_INTERVAL_MS = 2000;
+const SIGNAL_BACKGROUND_REALTIME_POLLING_INTERVAL_MS = 10000;
+const SIGNAL_BACKGROUND_FALLBACK_POLLING_INTERVAL_MS = 1500;
 const SIGNAL_POLLING_LOOKBACK_MS = 1500;
+const CALL_ANSWER_TIMEOUT_MS = 30000;
+const DISCONNECT_GRACE_MS = 8000;
 
 function createCallId() {
   if (globalThis.crypto?.randomUUID) {
-    return `call-${globalThis.crypto.randomUUID()}`;
+    return "call-" + globalThis.crypto.randomUUID();
   }
 
-  return `call-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return "call-" + Date.now() + "-" + Math.random().toString(16).slice(2);
+}
+
+function formatDuration(totalSeconds: number) {
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return String(minutes).padStart(2, "0") + ":" + String(seconds).padStart(2, "0");
 }
 
 async function readApiError(response: Response, fallback: string) {
@@ -43,6 +54,7 @@ export function VoiceCall({ sender, recipient }: VoiceCallProps) {
   const [error, setError] = useState<string | null>(null);
   const [isPanelOpen, setIsPanelOpen] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const statusRef = useRef(status);
   const callIdRef = useRef<string | null>(null);
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
@@ -50,8 +62,10 @@ export function VoiceCall({ sender, recipient }: VoiceCallProps) {
   const localStreamPromiseRef = useRef<Promise<MediaStream> | null>(null);
   const remoteAudioRef = useRef<HTMLAudioElement | null>(null);
   const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
-  const audioContextRef = useRef<AudioContext | null>(null);
   const ringtoneIntervalRef = useRef<number | null>(null);
+  const callTimeoutRef = useRef<number | null>(null);
+  const disconnectTimeoutRef = useRef<number | null>(null);
+  const callStartedAtRef = useRef<number | null>(null);
   const seenSignalIdsRef = useRef<Set<string>>(new Set());
   const lastSignalPollAtRef = useRef(new Date(Date.now() - 5000).toISOString());
   const pusherConnectedRef = useRef(false);
@@ -68,26 +82,19 @@ export function VoiceCall({ sender, recipient }: VoiceCallProps) {
     lastSignalPollAtRef.current = new Date(Date.now() - 5000).toISOString();
   }, [sender]);
 
-  const getAudioContext = useCallback(() => {
-    const WebAudioContext =
-      window.AudioContext ??
-      (window as Window & typeof globalThis & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-
-    if (!WebAudioContext) {
-      return null;
+  const clearCallTimeout = useCallback(() => {
+    if (callTimeoutRef.current) {
+      window.clearTimeout(callTimeoutRef.current);
+      callTimeoutRef.current = null;
     }
-
-    audioContextRef.current ??= new WebAudioContext();
-    return audioContextRef.current;
   }, []);
 
-  const unlockAudio = useCallback(async () => {
-    const audioContext = getAudioContext();
-
-    if (audioContext?.state === "suspended") {
-      await audioContext.resume().catch(() => undefined);
+  const clearDisconnectTimeout = useCallback(() => {
+    if (disconnectTimeoutRef.current) {
+      window.clearTimeout(disconnectTimeoutRef.current);
+      disconnectTimeoutRef.current = null;
     }
-  }, [getAudioContext]);
+  }, []);
 
   const stopRingtone = useCallback(() => {
     if (ringtoneIntervalRef.current) {
@@ -96,58 +103,32 @@ export function VoiceCall({ sender, recipient }: VoiceCallProps) {
     }
   }, []);
 
-  const playTone = useCallback(
-    (frequency: number, duration: number, delay = 0) => {
-      const audioContext = getAudioContext();
+  const playRingtonePattern = useCallback((mode: RingMode) => {
+    if (mode === "incoming") {
+      return playToneSequence([
+        { frequency: 740, duration: 0.18, volume: 0.08 },
+        { frequency: 740, start: 0.28, duration: 0.18, volume: 0.08 }
+      ]);
+    }
 
-      if (!audioContext) {
-        return;
-      }
-
-      const startAt = audioContext.currentTime + delay;
-      const oscillator = audioContext.createOscillator();
-      const gain = audioContext.createGain();
-
-      oscillator.type = "sine";
-      oscillator.frequency.setValueAtTime(frequency, startAt);
-      gain.gain.setValueAtTime(0.0001, startAt);
-      gain.gain.exponentialRampToValueAtTime(0.08, startAt + 0.02);
-      gain.gain.exponentialRampToValueAtTime(0.0001, startAt + duration);
-
-      oscillator.connect(gain);
-      gain.connect(audioContext.destination);
-      oscillator.start(startAt);
-      oscillator.stop(startAt + duration + 0.03);
-    },
-    [getAudioContext]
-  );
-
-  const playRingtonePattern = useCallback(
-    (mode: RingMode) => {
-      if (mode === "incoming") {
-        playTone(740, 0.18, 0);
-        playTone(740, 0.18, 0.28);
-        return;
-      }
-
-      playTone(520, 0.16, 0);
-      playTone(660, 0.16, 0.22);
-    },
-    [playTone]
-  );
+    return playToneSequence([
+      { frequency: 520, duration: 0.16, volume: 0.07 },
+      { frequency: 660, start: 0.22, duration: 0.16, volume: 0.07 }
+    ]);
+  }, []);
 
   const startRingtone = useCallback(
     (mode: RingMode) => {
       stopRingtone();
       void unlockAudio().then(() => {
-        playRingtonePattern(mode);
+        void playRingtonePattern(mode);
         ringtoneIntervalRef.current = window.setInterval(
-          () => playRingtonePattern(mode),
+          () => void playRingtonePattern(mode),
           mode === "incoming" ? 1400 : 1900
         );
       });
     },
-    [playRingtonePattern, stopRingtone, unlockAudio]
+    [playRingtonePattern, stopRingtone]
   );
 
   useEffect(() => {
@@ -162,7 +143,7 @@ export function VoiceCall({ sender, recipient }: VoiceCallProps) {
       document.removeEventListener("pointerdown", handleFirstInteraction);
       document.removeEventListener("keydown", handleFirstInteraction);
     };
-  }, [unlockAudio]);
+  }, []);
 
   useEffect(() => {
     if (status === "calling") {
@@ -177,6 +158,22 @@ export function VoiceCall({ sender, recipient }: VoiceCallProps) {
 
     stopRingtone();
   }, [startRingtone, status, stopRingtone]);
+
+  useEffect(() => {
+    if (!["active", "reconnecting"].includes(status) || !callStartedAtRef.current) {
+      return;
+    }
+
+    const updateDuration = () => {
+      if (callStartedAtRef.current) {
+        setElapsedSeconds(Math.floor((Date.now() - callStartedAtRef.current) / 1000));
+      }
+    };
+
+    updateDuration();
+    const intervalId = window.setInterval(updateDuration, 1000);
+    return () => window.clearInterval(intervalId);
+  }, [status]);
 
   const sendSignal = useCallback(
     async (type: CallSignalType, nextCallId: string, payload?: CallSignal["payload"]) => {
@@ -202,9 +199,19 @@ export function VoiceCall({ sender, recipient }: VoiceCallProps) {
   );
 
   const cleanupCall = useCallback(() => {
+    clearCallTimeout();
+    clearDisconnectTimeout();
     stopRingtone();
-    peerConnectionRef.current?.close();
+
+    const peerConnection = peerConnectionRef.current;
     peerConnectionRef.current = null;
+
+    if (peerConnection) {
+      peerConnection.onicecandidate = null;
+      peerConnection.ontrack = null;
+      peerConnection.onconnectionstatechange = null;
+      peerConnection.close();
+    }
 
     localStreamRef.current?.getTracks().forEach((track) => track.stop());
     localStreamRef.current = null;
@@ -216,9 +223,20 @@ export function VoiceCall({ sender, recipient }: VoiceCallProps) {
 
     pendingCandidatesRef.current = [];
     callIdRef.current = null;
+    callStartedAtRef.current = null;
+    setElapsedSeconds(0);
     setStatus("idle");
     setIsMuted(false);
-  }, [stopRingtone]);
+  }, [clearCallTimeout, clearDisconnectTimeout, stopRingtone]);
+
+  const endCallWithError = useCallback(
+    (message: string) => {
+      cleanupCall();
+      setIsPanelOpen(true);
+      setError(message);
+    },
+    [cleanupCall]
+  );
 
   const closePanel = useCallback(() => {
     setError(null);
@@ -271,7 +289,14 @@ export function VoiceCall({ sender, recipient }: VoiceCallProps) {
 
   const createPeerConnection = useCallback(
     (nextCallId: string) => {
-      peerConnectionRef.current?.close();
+      const existingConnection = peerConnectionRef.current;
+
+      if (existingConnection) {
+        existingConnection.onicecandidate = null;
+        existingConnection.ontrack = null;
+        existingConnection.onconnectionstatechange = null;
+        existingConnection.close();
+      }
 
       const peerConnection = new RTCPeerConnection({
         iceServers: ICE_SERVERS
@@ -281,7 +306,7 @@ export function VoiceCall({ sender, recipient }: VoiceCallProps) {
         if (event.candidate) {
           void sendSignal("ice-candidate", nextCallId, {
             candidate: event.candidate.toJSON()
-          });
+          }).catch(() => undefined);
         }
       };
 
@@ -293,25 +318,49 @@ export function VoiceCall({ sender, recipient }: VoiceCallProps) {
           void remoteAudioRef.current.play().catch(() => undefined);
         }
 
+        clearCallTimeout();
+        clearDisconnectTimeout();
+        callStartedAtRef.current ??= Date.now();
         setStatus("active");
       };
 
       peerConnection.onconnectionstatechange = () => {
-        if (["failed", "closed"].includes(peerConnection.connectionState)) {
-          cleanupCall();
+        const connectionState = peerConnection.connectionState;
+
+        if (connectionState === "connected") {
+          clearCallTimeout();
+          clearDisconnectTimeout();
+          callStartedAtRef.current ??= Date.now();
+          setStatus("active");
+          return;
+        }
+
+        if (connectionState === "disconnected") {
+          setStatus("reconnecting");
+          clearDisconnectTimeout();
+          disconnectTimeoutRef.current = window.setTimeout(() => {
+            void sendSignal("hangup", nextCallId).catch(() => undefined);
+            endCallWithError("通話連線中斷。");
+          }, DISCONNECT_GRACE_MS);
+          return;
+        }
+
+        if (connectionState === "failed") {
+          void sendSignal("hangup", nextCallId).catch(() => undefined);
+          endCallWithError("語音通話連線失敗。");
         }
       };
 
       peerConnectionRef.current = peerConnection;
       return peerConnection;
     },
-    [cleanupCall, sendSignal]
+    [clearCallTimeout, clearDisconnectTimeout, endCallWithError, sendSignal]
   );
 
   const addLocalTracks = useCallback(
     async (peerConnection: RTCPeerConnection) => {
       const localStream = await getLocalStream();
-      const existingTrackIds = new Set(peerConnection.getSenders().map((sender) => sender.track?.id));
+      const existingTrackIds = new Set(peerConnection.getSenders().map((streamSender) => streamSender.track?.id));
 
       localStream.getTracks().forEach((track) => {
         if (!existingTrackIds.has(track.id)) {
@@ -332,14 +381,16 @@ export function VoiceCall({ sender, recipient }: VoiceCallProps) {
 
     try {
       await sendSignal("call-request", nextCallId);
+      callTimeoutRef.current = window.setTimeout(() => {
+        void sendSignal("hangup", nextCallId).catch(() => undefined);
+        endCallWithError("對方未接聽。");
+      }, CALL_ANSWER_TIMEOUT_MS);
       await getLocalStream();
     } catch (callError) {
       await sendSignal("hangup", nextCallId).catch(() => undefined);
-      cleanupCall();
-      setIsPanelOpen(true);
-      setError(callError instanceof Error ? callError.message : "無法開始語音通話。");
+      endCallWithError(callError instanceof Error ? callError.message : "無法開始語音通話。");
     }
-  }, [cleanupCall, getLocalStream, sendSignal]);
+  }, [endCallWithError, getLocalStream, sendSignal]);
 
   const acceptCall = useCallback(async () => {
     const activeCallId = callIdRef.current;
@@ -348,6 +399,7 @@ export function VoiceCall({ sender, recipient }: VoiceCallProps) {
       return;
     }
 
+    clearCallTimeout();
     setError(null);
     setStatus("connecting");
 
@@ -357,10 +409,9 @@ export function VoiceCall({ sender, recipient }: VoiceCallProps) {
       await sendSignal("call-accept", activeCallId);
     } catch (callError) {
       await sendSignal("hangup", activeCallId).catch(() => undefined);
-      cleanupCall();
-      setError(callError instanceof Error ? callError.message : "無法接聽語音通話。");
+      endCallWithError(callError instanceof Error ? callError.message : "無法接聽語音通話。");
     }
-  }, [addLocalTracks, cleanupCall, createPeerConnection, sendSignal]);
+  }, [addLocalTracks, clearCallTimeout, createPeerConnection, endCallWithError, sendSignal]);
 
   const rejectCall = useCallback(async () => {
     const activeCallId = callIdRef.current;
@@ -393,9 +444,14 @@ export function VoiceCall({ sender, recipient }: VoiceCallProps) {
   }, [isMuted]);
 
   const markSignalSeen = useCallback((signal: CallSignal) => {
-    const fallbackKey = `${signal.type}:${signal.callId}:${signal.from}:${signal.to}:${signal.createdAt ?? ""}:${JSON.stringify(
-      signal.payload ?? {}
-    )}`;
+    const fallbackKey = [
+      signal.type,
+      signal.callId,
+      signal.from,
+      signal.to,
+      signal.createdAt ?? "",
+      JSON.stringify(signal.payload ?? {})
+    ].join(":");
     const signalKey = signal.id ?? fallbackKey;
     const seenSignals = seenSignalIdsRef.current;
 
@@ -432,6 +488,10 @@ export function VoiceCall({ sender, recipient }: VoiceCallProps) {
         setIsPanelOpen(true);
         setError(null);
         setStatus("ringing");
+        callTimeoutRef.current = window.setTimeout(() => {
+          void sendSignal("call-reject", signal.callId).catch(() => undefined);
+          endCallWithError("未接來電已結束。");
+        }, CALL_ANSWER_TIMEOUT_MS);
         return;
       }
 
@@ -440,20 +500,17 @@ export function VoiceCall({ sender, recipient }: VoiceCallProps) {
       }
 
       if (signal.type === "call-reject") {
-        cleanupCall();
-        setIsPanelOpen(true);
-        setError(`${SENDER_LABEL[recipient]} 沒有接聽。`);
+        endCallWithError(SENDER_LABEL[recipient] + " 沒有接聽。");
         return;
       }
 
       if (signal.type === "hangup") {
-        cleanupCall();
-        setIsPanelOpen(true);
-        setError(`${SENDER_LABEL[recipient]} 已掛斷。`);
+        endCallWithError(SENDER_LABEL[recipient] + " 已掛斷。");
         return;
       }
 
       if (signal.type === "call-accept") {
+        clearCallTimeout();
         setStatus("connecting");
 
         try {
@@ -464,9 +521,7 @@ export function VoiceCall({ sender, recipient }: VoiceCallProps) {
           await sendSignal("offer", signal.callId, { offer });
         } catch (callError) {
           await sendSignal("hangup", signal.callId).catch(() => undefined);
-          cleanupCall();
-          setIsPanelOpen(true);
-          setError(callError instanceof Error ? callError.message : "語音通話連線失敗。");
+          endCallWithError(callError instanceof Error ? callError.message : "語音通話連線失敗。");
         }
         return;
       }
@@ -484,9 +539,7 @@ export function VoiceCall({ sender, recipient }: VoiceCallProps) {
           setStatus("connecting");
         } catch (callError) {
           await sendSignal("hangup", signal.callId).catch(() => undefined);
-          cleanupCall();
-          setIsPanelOpen(true);
-          setError(callError instanceof Error ? callError.message : "語音通話連線失敗。");
+          endCallWithError(callError instanceof Error ? callError.message : "語音通話連線失敗。");
         }
         return;
       }
@@ -497,6 +550,7 @@ export function VoiceCall({ sender, recipient }: VoiceCallProps) {
         if (peerConnection) {
           await peerConnection.setRemoteDescription(signal.payload.answer).catch(() => undefined);
           await addPendingCandidates();
+          callStartedAtRef.current ??= Date.now();
           setStatus("active");
         }
         return;
@@ -516,8 +570,9 @@ export function VoiceCall({ sender, recipient }: VoiceCallProps) {
     [
       addLocalTracks,
       addPendingCandidates,
-      cleanupCall,
+      clearCallTimeout,
       createPeerConnection,
+      endCallWithError,
       recipient,
       sendSignal,
       sender
@@ -568,14 +623,18 @@ export function VoiceCall({ sender, recipient }: VoiceCallProps) {
 
     function getPollingDelay() {
       if (document.hidden) {
-        return SIGNAL_BACKGROUND_POLLING_INTERVAL_MS;
+        return pusherConnectedRef.current
+          ? SIGNAL_BACKGROUND_REALTIME_POLLING_INTERVAL_MS
+          : SIGNAL_BACKGROUND_FALLBACK_POLLING_INTERVAL_MS;
       }
 
       if (statusRef.current !== "idle") {
         return SIGNAL_FAST_POLLING_INTERVAL_MS;
       }
 
-      return pusherConnectedRef.current ? SIGNAL_IDLE_REALTIME_POLLING_INTERVAL_MS : SIGNAL_FAST_POLLING_INTERVAL_MS;
+      return pusherConnectedRef.current
+        ? SIGNAL_IDLE_REALTIME_POLLING_INTERVAL_MS
+        : SIGNAL_IDLE_FALLBACK_POLLING_INTERVAL_MS;
     }
 
     function schedulePoll(delay = getPollingDelay()) {
@@ -602,7 +661,7 @@ export function VoiceCall({ sender, recipient }: VoiceCallProps) {
       ).toISOString();
 
       try {
-        const response = await fetch(`/api/call?to=${sender}&since=${encodeURIComponent(since)}`, {
+        const response = await fetch("/api/call?to=" + sender + "&since=" + encodeURIComponent(since), {
           cache: "no-store"
         });
 
@@ -624,7 +683,7 @@ export function VoiceCall({ sender, recipient }: VoiceCallProps) {
 
         lastSignalPollAtRef.current = new Date(Math.max(latestSignalTime, Date.now())).toISOString();
       } catch {
-        // Pusher is still the primary path; polling errors are retried on the next tick.
+        // Retried on the next adaptive polling tick.
       }
     }
 
@@ -647,22 +706,23 @@ export function VoiceCall({ sender, recipient }: VoiceCallProps) {
 
   useEffect(() => {
     return () => {
-      stopRingtone();
       cleanupCall();
     };
-  }, [cleanupCall, stopRingtone]);
+  }, [cleanupCall]);
 
   const showCallPanel = isPanelOpen || status !== "idle" || Boolean(error);
   const statusText =
     status === "calling"
-      ? `正在撥打 ${SENDER_LABEL[recipient]}`
+      ? "正在撥打 " + SENDER_LABEL[recipient]
       : status === "ringing"
-        ? `${SENDER_LABEL[recipient]} 來電`
+        ? SENDER_LABEL[recipient] + " 來電"
         : status === "connecting"
           ? "語音連線中"
-          : status === "active"
-            ? `與 ${SENDER_LABEL[recipient]} 通話中`
-            : error;
+          : status === "reconnecting"
+            ? "連線不穩，正在重新連線"
+            : status === "active"
+              ? "與 " + SENDER_LABEL[recipient] + " 通話中"
+              : error;
 
   return (
     <>
@@ -680,7 +740,11 @@ export function VoiceCall({ sender, recipient }: VoiceCallProps) {
       <audio ref={remoteAudioRef} autoPlay playsInline />
 
       {showCallPanel ? (
-        <div className="fixed right-4 top-20 z-[1000] w-[min(calc(100vw-2rem),380px)] rounded-lg border border-line bg-white p-3 shadow-soft">
+        <div
+          role="dialog"
+          aria-live="assertive"
+          className="fixed right-4 top-20 z-[1000] w-[min(calc(100vw-2rem),380px)] rounded-lg border border-line bg-white p-3 shadow-soft"
+        >
           <div className="flex items-center gap-3">
             <div
               className={clsx(
@@ -692,6 +756,9 @@ export function VoiceCall({ sender, recipient }: VoiceCallProps) {
             </div>
             <div className="min-w-0 flex-1">
               <p className="truncate text-sm font-semibold text-ink">{statusText}</p>
+              {["active", "reconnecting"].includes(status) ? (
+                <p className="mt-0.5 text-xs tabular-nums text-slate-500">{formatDuration(elapsedSeconds)}</p>
+              ) : null}
               {error ? <p className="mt-0.5 text-xs text-red-600">{error}</p> : null}
             </div>
             {status === "idle" ? (

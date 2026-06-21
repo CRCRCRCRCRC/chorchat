@@ -7,6 +7,8 @@ import { ChatComposer, type ComposerPayload } from "@/components/chat-composer";
 import { ImageLightbox } from "@/components/image-lightbox";
 import { MessageBubble } from "@/components/message-bubble";
 import { VoiceCall } from "@/components/voice-call";
+import { playMessageNotificationSound, unlockAudio } from "@/lib/audio-client";
+import { clearBrowserUnreadBadge, updateBrowserUnreadBadge } from "@/lib/browser-badge";
 import { PUSHER_CHANNEL, PUSHER_EVENT_MESSAGES_CHANGED, PUSHER_EVENT_TYPING_CHANGED } from "@/lib/realtime";
 import { getMessageMinuteKey } from "@/lib/time";
 import { OTHER_SENDER, SENDER_LABEL, type Message, type Sender } from "@/lib/types";
@@ -18,7 +20,8 @@ type ChatRoomProps = {
 
 const MESSAGE_FALLBACK_POLLING_INTERVAL_MS = 1500;
 const MESSAGE_REALTIME_HEALTH_CHECK_MS = 15000;
-const MESSAGE_BACKGROUND_POLLING_INTERVAL_MS = 30000;
+const MESSAGE_REALTIME_BACKGROUND_POLLING_INTERVAL_MS = 60000;
+const MESSAGE_FALLBACK_BACKGROUND_POLLING_INTERVAL_MS = 5000;
 const MAX_SERVER_UPLOAD_BYTES = 4 * 1024 * 1024;
 const MAX_IMAGE_DIMENSION = 1800;
 const JPEG_QUALITIES = [0.82, 0.74, 0.66, 0.58];
@@ -29,13 +32,30 @@ function sortMessagesByCreatedAt(messages: Message[]) {
   return [...messages].sort((first, second) => new Date(first.createdAt).getTime() - new Date(second.createdAt).getTime());
 }
 
+function areMessagesEquivalent(first: Message[], second: Message[]) {
+  return (
+    first.length === second.length &&
+    first.every((message, index) => {
+      const nextMessage = second[index];
+
+      return (
+        message.id === nextMessage?.id &&
+        message.updatedAt === nextMessage.updatedAt &&
+        message.readAt === nextMessage.readAt &&
+        message.clientStatus === nextMessage.clientStatus
+      );
+    })
+  );
+}
+
 function mergeLoadedMessages(currentMessages: Message[], loadedMessages: Message[]) {
   const loadedIds = new Set(loadedMessages.map((message) => message.id));
   const pendingMessages = currentMessages.filter(
     (message) => message.clientStatus && message.id.startsWith("optimistic-") && !loadedIds.has(message.id)
   );
 
-  return sortMessagesByCreatedAt([...loadedMessages, ...pendingMessages]);
+  const mergedMessages = sortMessagesByCreatedAt([...loadedMessages, ...pendingMessages]);
+  return areMessagesEquivalent(currentMessages, mergedMessages) ? currentMessages : mergedMessages;
 }
 
 function getOptimisticId() {
@@ -148,6 +168,8 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
   const [lightboxImages, setLightboxImages] = useState<{ urls: string[]; index: number } | null>(null);
   const [highlightedId, setHighlightedId] = useState<string | null>(null);
   const [isOtherTyping, setIsOtherTyping] = useState(false);
+  const [isPageActive, setIsPageActive] = useState(true);
+  const [unreadCount, setUnreadCount] = useState(0);
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const loadMessagesPromiseRef = useRef<Promise<void> | null>(null);
   const optimisticImageUrlsRef = useRef<Map<string, string>>(new Map());
@@ -156,6 +178,8 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
   const otherTypingTimerRef = useRef<number | null>(null);
   const readSyncRef = useRef(false);
   const hasSentTypingRef = useRef(false);
+  const knownMessageIdsRef = useRef<Set<string>>(new Set());
+  const hasInitializedMessageTrackingRef = useRef(false);
 
   const otherSender = OTHER_SENDER[sender];
 
@@ -213,6 +237,38 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
   }, [loadMessages, sender]);
 
   useEffect(() => {
+    function updatePageActivity() {
+      const isActive = document.visibilityState === "visible" && document.hasFocus();
+      setIsPageActive(isActive);
+
+      if (isActive) {
+        setUnreadCount(0);
+        void unlockAudio();
+        void loadMessages().catch(() => undefined);
+      }
+    }
+
+    updatePageActivity();
+    document.addEventListener("visibilitychange", updatePageActivity);
+    window.addEventListener("focus", updatePageActivity);
+    window.addEventListener("blur", updatePageActivity);
+
+    return () => {
+      document.removeEventListener("visibilitychange", updatePageActivity);
+      window.removeEventListener("focus", updatePageActivity);
+      window.removeEventListener("blur", updatePageActivity);
+    };
+  }, [loadMessages]);
+
+  useEffect(() => {
+    updateBrowserUnreadBadge(unreadCount);
+  }, [unreadCount]);
+
+  useEffect(() => {
+    return () => clearBrowserUnreadBadge();
+  }, []);
+
+  useEffect(() => {
     const key = process.env.NEXT_PUBLIC_PUSHER_KEY;
     const cluster = process.env.NEXT_PUBLIC_PUSHER_CLUSTER;
     let timeoutId: number | null = null;
@@ -220,7 +276,9 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
 
     function getPollingDelay() {
       if (document.hidden) {
-        return MESSAGE_BACKGROUND_POLLING_INTERVAL_MS;
+        return realtimeConnectedRef.current
+          ? MESSAGE_REALTIME_BACKGROUND_POLLING_INTERVAL_MS
+          : MESSAGE_FALLBACK_BACKGROUND_POLLING_INTERVAL_MS;
       }
 
       return realtimeConnectedRef.current ? MESSAGE_REALTIME_HEALTH_CHECK_MS : MESSAGE_FALLBACK_POLLING_INTERVAL_MS;
@@ -363,6 +421,49 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
   }, [messages, sender]);
 
   useEffect(() => {
+    if (isLoading) {
+      return;
+    }
+
+    const persistedMessages = messages.filter((message) => !message.clientStatus);
+    const knownMessageIds = knownMessageIdsRef.current;
+
+    if (!hasInitializedMessageTrackingRef.current) {
+      persistedMessages.forEach((message) => knownMessageIds.add(message.id));
+      hasInitializedMessageTrackingRef.current = true;
+      return;
+    }
+
+    let newIncomingMessageCount = 0;
+
+    persistedMessages.forEach((message) => {
+      if (knownMessageIds.has(message.id)) {
+        return;
+      }
+
+      knownMessageIds.add(message.id);
+
+      if (message.sender !== sender && !message.recalledAt) {
+        newIncomingMessageCount += 1;
+      }
+    });
+
+    if (newIncomingMessageCount === 0) {
+      return;
+    }
+
+    void playMessageNotificationSound();
+
+    if (!isPageActive) {
+      setUnreadCount((currentCount) => currentCount + newIncomingMessageCount);
+    }
+  }, [isLoading, isPageActive, messages, sender]);
+
+  useEffect(() => {
+    if (!isPageActive) {
+      return;
+    }
+
     const hasUnreadIncomingMessages = messages.some(
       (message) => message.sender !== sender && !message.readAt && !message.clientStatus
     );
@@ -404,7 +505,7 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
       .finally(() => {
         readSyncRef.current = false;
       });
-  }, [loadMessages, messages, sender]);
+  }, [isPageActive, loadMessages, messages, sender]);
 
   function focusMessage(messageId: string) {
     document.getElementById(`message-${messageId}`)?.scrollIntoView({

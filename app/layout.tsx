@@ -3,7 +3,10 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "chorchat",
-  description: "Realtime chat for Chen and Zuo"
+  description: "Realtime chat for Chen and Zuo",
+  icons: {
+    icon: "/chorchat-icon.svg"
+  }
 };
 
 export default function RootLayout({

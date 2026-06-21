@@ -17,6 +17,8 @@
 - PostgreSQL 資料庫儲存訊息
 - Pusher Channels 即時同步，未設定 Pusher 時本機用短輪詢 fallback
 - 語音通話訊號會同時走 Pusher 與 PostgreSQL 輪詢備援，避免 websocket event 漏接
+- 背景分頁收到新訊息時顯示未讀數、favicon 紅點並播放短通知音效
+- 語音通話支援來電鈴聲、未接逾時、斷線重連狀態與通話時間
 
 ## 技術
 

@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { ChatRoom } from "@/components/chat-room";
+import { unlockAudio } from "@/lib/audio-client";
 import { SENDER_LABEL, type Sender, isSender } from "@/lib/types";
 
 const STORAGE_KEY = "chorchat:sender";
@@ -21,6 +22,7 @@ export function HomeClient() {
   }, []);
 
   function chooseSender(nextSender: Sender) {
+    void unlockAudio();
     window.localStorage.setItem(STORAGE_KEY, nextSender);
     setSender(nextSender);
   }
