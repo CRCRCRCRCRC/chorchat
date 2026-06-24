@@ -1,14 +1,17 @@
 "use client";
 
-import { ArrowDown, ArrowLeft, RefreshCw } from "lucide-react";
+import { ArrowDown, ArrowLeft, Images, Pin, RefreshCw, Search } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ChatComposer, type ComposerPayload } from "@/components/chat-composer";
+import { ChatToolsDialog, type ChatToolMode } from "@/components/chat-tools-dialog";
 import { ImageLightbox } from "@/components/image-lightbox";
 import { MessageBubble } from "@/components/message-bubble";
 import { VoiceCall } from "@/components/voice-call";
 import { playMessageNotificationSound, unlockAudio } from "@/lib/audio-client";
 import { clearBrowserUnreadBadge, updateBrowserUnreadBadge } from "@/lib/browser-badge";
+import { formatPresence, usePresence } from "@/lib/presence-client";
 import { acquireRealtimeChannel } from "@/lib/pusher-client";
+import type { ReactionEmoji } from "@/lib/reactions";
 import { PUSHER_EVENT_MESSAGES_CHANGED, PUSHER_EVENT_TYPING_CHANGED } from "@/lib/realtime";
 import { getMessageMinuteKey } from "@/lib/time";
 import { OTHER_SENDER, SENDER_LABEL, type Message, type Sender } from "@/lib/types";
@@ -53,6 +56,15 @@ function areMessagesEquivalent(first: Message[], second: Message[]) {
         message.id === nextMessage?.id &&
         message.updatedAt === nextMessage.updatedAt &&
         message.readAt === nextMessage.readAt &&
+        message.pinnedAt === nextMessage.pinnedAt &&
+        message.pinnedBy === nextMessage.pinnedBy &&
+        message.reactions.length === nextMessage.reactions.length &&
+        message.reactions.every(
+          (reaction, reactionIndex) =>
+            reaction.id === nextMessage.reactions[reactionIndex]?.id &&
+            reaction.sender === nextMessage.reactions[reactionIndex]?.sender &&
+            reaction.emoji === nextMessage.reactions[reactionIndex]?.emoji
+        ) &&
         message.clientStatus === nextMessage.clientStatus
       );
     })
@@ -203,6 +215,7 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
   const [unreadCount, setUnreadCount] = useState(0);
   const [unreadBelowCount, setUnreadBelowCount] = useState(0);
   const [isAwayFromBottom, setIsAwayFromBottom] = useState(false);
+  const [activeTool, setActiveTool] = useState<ChatToolMode | null>(null);
   const chatScrollRef = useRef<HTMLElement | null>(null);
   const hasInitialScrolledRef = useRef(false);
   const latestRenderedMessageIdRef = useRef<string | null>(null);
@@ -221,6 +234,11 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
   const hasInitializedMessageTrackingRef = useRef(false);
 
   const otherSender = OTHER_SENDER[sender];
+  const otherPresence = usePresence(sender, otherSender);
+  const pinnedMessageCount = useMemo(
+    () => messages.filter((message) => message.pinnedAt && !message.recalledAt && !message.clientStatus).length,
+    [messages]
+  );
 
   const loadMessages = useCallback(async () => {
     if (loadMessagesPromiseRef.current) {
@@ -874,8 +892,11 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
         editedAt: null,
         recalledAt: null,
         readAt: null,
+        pinnedAt: null,
+        pinnedBy: null,
         replyToMessageId: replyTarget?.id ?? null,
         replyTo: replyTarget ? toReplyMessage(replyTarget) : null,
+        reactions: [],
         clientStatus: "sending"
       });
     }
@@ -900,8 +921,11 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
         editedAt: null,
         recalledAt: null,
         readAt: null,
+        pinnedAt: null,
+        pinnedBy: null,
         replyToMessageId: imageReplyTarget?.id ?? null,
         replyTo: imageReplyTarget ? toReplyMessage(imageReplyTarget) : null,
+        reactions: [],
         clientStatus: "sending"
       });
     }
@@ -987,6 +1011,88 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
     }
   }
 
+  async function handleToggleReaction(message: Message, emoji: ReactionEmoji) {
+    setError(null);
+    const existingReaction = message.reactions.find(
+      (reaction) => reaction.sender === sender && reaction.emoji === emoji
+    );
+    const optimisticReactions = existingReaction
+      ? message.reactions.filter((reaction) => reaction.id !== existingReaction.id)
+      : [
+          ...message.reactions,
+          {
+            id: `optimistic-reaction-${sender}-${emoji}`,
+            sender,
+            emoji,
+            createdAt: new Date().toISOString()
+          }
+        ];
+
+    setMessages((currentMessages) =>
+      currentMessages.map((currentMessage) =>
+        currentMessage.id === message.id ? { ...currentMessage, reactions: optimisticReactions } : currentMessage
+      )
+    );
+
+    try {
+      const response = await fetch(`/api/messages/${message.id}/reactions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sender, emoji })
+      });
+
+      if (!response.ok) {
+        throw new Error(await readApiError(response, "表情回應失敗"));
+      }
+
+      const data = (await response.json()) as { message: Message };
+      setMessages((currentMessages) =>
+        currentMessages.map((currentMessage) => (currentMessage.id === message.id ? data.message : currentMessage))
+      );
+    } catch (reactionError) {
+      setError(reactionError instanceof Error ? reactionError.message : "表情回應失敗");
+      void loadMessages().catch(() => undefined);
+    }
+  }
+
+  async function handleTogglePin(message: Message) {
+    setError(null);
+    const shouldPin = !message.pinnedAt;
+    const optimisticPinnedAt = shouldPin ? new Date().toISOString() : null;
+
+    setMessages((currentMessages) =>
+      currentMessages.map((currentMessage) =>
+        currentMessage.id === message.id
+          ? {
+              ...currentMessage,
+              pinnedAt: optimisticPinnedAt,
+              pinnedBy: shouldPin ? sender : null
+            }
+          : currentMessage
+      )
+    );
+
+    try {
+      const response = await fetch(`/api/messages/${message.id}/pin`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sender, pinned: shouldPin })
+      });
+
+      if (!response.ok) {
+        throw new Error(await readApiError(response, "置頂操作失敗"));
+      }
+
+      const data = (await response.json()) as { message: Message };
+      setMessages((currentMessages) =>
+        currentMessages.map((currentMessage) => (currentMessage.id === message.id ? data.message : currentMessage))
+      );
+    } catch (pinError) {
+      setError(pinError instanceof Error ? pinError.message : "置頂操作失敗");
+      void loadMessages().catch(() => undefined);
+    }
+  }
+
   function handleStartEdit(message: Message) {
     setReplyTo(null);
     setEditing(message);
@@ -994,8 +1100,8 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
 
   return (
     <main className="flex h-dvh flex-col bg-paper text-ink">
-      <header className="border-b border-line bg-white/95 px-4 py-3 backdrop-blur">
-        <div className="mx-auto flex max-w-5xl items-center justify-between gap-3">
+      <header className="border-b border-line bg-white/95 backdrop-blur">
+        <div className="mx-auto flex max-w-5xl items-center justify-between gap-3 px-4 py-3">
           <button
             type="button"
             onClick={onSwitchIdentity}
@@ -1007,8 +1113,13 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
 
           <div className="min-w-0 text-center">
             <h1 className="truncate text-lg font-semibold">chorchat</h1>
-            <p className="truncate text-xs text-slate-500">
-              你是 {SENDER_LABEL[sender]}，正在與 {SENDER_LABEL[otherSender]} 對話
+            <p className="flex items-center justify-center gap-1.5 truncate text-xs text-slate-500">
+              <span
+                className={`h-2 w-2 shrink-0 rounded-full ${otherPresence.isOnline ? "bg-emerald-500" : "bg-slate-300"}`}
+              />
+              <span className="truncate">
+                {SENDER_LABEL[otherSender]} · {formatPresence(otherPresence)}
+              </span>
             </p>
           </div>
 
@@ -1024,6 +1135,36 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
             </button>
           </div>
         </div>
+        <nav className="border-t border-line/80 px-3 py-2" aria-label="聊天室工具">
+          <div className="mx-auto grid max-w-5xl grid-cols-3 gap-2">
+            <button
+              type="button"
+              onClick={() => setActiveTool("search")}
+              className="inline-flex h-9 items-center justify-center gap-2 rounded-md text-sm font-medium text-slate-600 hover:bg-slate-100 hover:text-ink"
+            >
+              <Search size={16} />搜尋
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveTool("media")}
+              className="inline-flex h-9 items-center justify-center gap-2 rounded-md text-sm font-medium text-slate-600 hover:bg-slate-100 hover:text-ink"
+            >
+              <Images size={16} />媒體
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveTool("pinned")}
+              className="inline-flex h-9 items-center justify-center gap-2 rounded-md text-sm font-medium text-slate-600 hover:bg-slate-100 hover:text-ink"
+            >
+              <Pin size={16} />置頂
+              {pinnedMessageCount > 0 ? (
+                <span className="inline-flex min-w-5 items-center justify-center rounded-md bg-blue-50 px-1 text-xs text-brand">
+                  {pinnedMessageCount}
+                </span>
+              ) : null}
+            </button>
+          </div>
+        </nav>
       </header>
 
       <section
@@ -1072,6 +1213,8 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
                 }}
                 onEdit={() => handleStartEdit(message)}
                 onRecall={() => void handleRecall(message)}
+                onTogglePin={() => void handleTogglePin(message)}
+                onToggleReaction={(emoji) => void handleToggleReaction(message, emoji)}
                 onOpenImages={(urls, index = 0) => setLightboxImages({ urls, index })}
                 onQuoteClick={focusMessage}
               />
@@ -1111,6 +1254,16 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
         onTypingActivity={handleTypingActivity}
         onSubmit={handleSubmit}
       />
+
+      {activeTool ? (
+        <ChatToolsDialog
+          mode={activeTool}
+          messages={messages}
+          onClose={() => setActiveTool(null)}
+          onFocusMessage={focusMessage}
+          onOpenImages={(urls, index) => setLightboxImages({ urls, index })}
+        />
+      ) : null}
 
       <ImageLightbox
         imageUrls={lightboxImages?.urls ?? []}

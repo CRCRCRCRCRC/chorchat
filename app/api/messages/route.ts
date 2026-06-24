@@ -1,5 +1,6 @@
 import { after, NextResponse } from "next/server";
 import { z } from "zod";
+import { messageInclude } from "@/lib/message-query";
 import { prisma } from "@/lib/prisma";
 import { notifyMessagesChanged } from "@/lib/pusher-server";
 
@@ -23,21 +24,6 @@ const createMessageSchema = z.union([
     messages: z.array(messageInputSchema).min(1).max(10)
   })
 ]);
-
-const messageInclude = {
-  replyTo: {
-    select: {
-      id: true,
-      sender: true,
-      text: true,
-      imageUrl: true,
-      imageUrls: true,
-      createdAt: true,
-      editedAt: true,
-      recalledAt: true
-    }
-  }
-} as const;
 
 type MessageInput = z.infer<typeof messageInputSchema>;
 

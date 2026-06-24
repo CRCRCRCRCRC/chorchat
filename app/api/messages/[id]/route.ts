@@ -1,5 +1,6 @@
-import { NextResponse } from "next/server";
+import { after, NextResponse } from "next/server";
 import { z } from "zod";
+import { messageInclude } from "@/lib/message-query";
 import { canEditMessage } from "@/lib/time";
 import { prisma } from "@/lib/prisma";
 import { notifyMessagesChanged } from "@/lib/pusher-server";
@@ -14,21 +15,6 @@ const updateMessageSchema = z.object({
 const recallMessageSchema = z.object({
   sender: z.enum(["CHEN", "ZUO"])
 });
-
-const messageInclude = {
-  replyTo: {
-    select: {
-      id: true,
-      sender: true,
-      text: true,
-      imageUrl: true,
-      imageUrls: true,
-      createdAt: true,
-      editedAt: true,
-      recalledAt: true
-    }
-  }
-} as const;
 
 type RouteContext = {
   params: Promise<{
@@ -69,7 +55,7 @@ export async function PATCH(request: Request, context: RouteContext) {
     include: messageInclude
   });
 
-  await notifyMessagesChanged({ type: "edited", id: message.id });
+  after(() => notifyMessagesChanged({ type: "edited", id: message.id }));
 
   return NextResponse.json({ message });
 }
@@ -103,18 +89,24 @@ export async function DELETE(request: Request, context: RouteContext) {
     return NextResponse.json({ message });
   }
 
-  const message = await prisma.message.update({
-    where: { id },
-    data: {
-      text: null,
-      imageUrl: null,
-      imageUrls: [],
-      recalledAt: new Date()
-    },
-    include: messageInclude
+  const message = await prisma.$transaction(async (transaction) => {
+    await transaction.messageReaction.deleteMany({ where: { messageId: id } });
+
+    return transaction.message.update({
+      where: { id },
+      data: {
+        text: null,
+        imageUrl: null,
+        imageUrls: [],
+        pinnedAt: null,
+        pinnedBy: null,
+        recalledAt: new Date()
+      },
+      include: messageInclude
+    });
   });
 
-  await notifyMessagesChanged({ type: "recalled", id: message.id });
+  after(() => notifyMessagesChanged({ type: "recalled", id: message.id }));
 
   return NextResponse.json({ message });
 }

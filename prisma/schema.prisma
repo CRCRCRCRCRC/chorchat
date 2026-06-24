@@ -23,14 +23,39 @@ model Message {
   editedAt         DateTime? @map("edited_at")
   recalledAt       DateTime? @map("recalled_at")
   readAt           DateTime? @map("read_at")
+  pinnedAt         DateTime? @map("pinned_at")
+  pinnedBy         Sender?   @map("pinned_by")
   replyToMessageId String?   @map("reply_to_message_id")
 
-  replyTo Message?  @relation("MessageReplies", fields: [replyToMessageId], references: [id], onDelete: SetNull)
-  replies Message[] @relation("MessageReplies")
+  replyTo   Message?          @relation("MessageReplies", fields: [replyToMessageId], references: [id], onDelete: SetNull)
+  replies   Message[]         @relation("MessageReplies")
+  reactions MessageReaction[]
 
   @@index([createdAt])
+  @@index([pinnedAt])
   @@index([replyToMessageId])
   @@map("messages")
+}
+
+model MessageReaction {
+  id        String   @id @default(cuid())
+  messageId String   @map("message_id")
+  sender    Sender
+  emoji     String
+  createdAt DateTime @default(now()) @map("created_at")
+
+  message Message @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  @@unique([messageId, sender, emoji])
+  @@index([messageId])
+  @@map("message_reactions")
+}
+
+model Presence {
+  sender     Sender   @id
+  lastSeenAt DateTime @default(now()) @map("last_seen_at")
+
+  @@map("presence")
 }
 
 model CallSignal {

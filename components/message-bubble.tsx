@@ -3,12 +3,13 @@
 /* eslint-disable @next/next/no-img-element */
 
 import clsx from "clsx";
-import { MoreHorizontal } from "lucide-react";
+import { MoreHorizontal, Pin } from "lucide-react";
 import { memo, useEffect, useRef, useState } from "react";
 import { LinkifiedText } from "@/components/linkified-text";
 import { LinkPreviewCard } from "@/components/link-preview-card";
 import { getFirstUrl } from "@/lib/links";
 import { getMessageImageUrls, getReplyPreview } from "@/lib/messages";
+import { REACTION_EMOJIS, type ReactionEmoji } from "@/lib/reactions";
 import { canEditMessage, formatMessageTime } from "@/lib/time";
 import { SENDER_LABEL, type Message, type Sender } from "@/lib/types";
 
@@ -21,6 +22,8 @@ type MessageBubbleProps = {
   onReply: () => void;
   onEdit: () => void;
   onRecall: () => void;
+  onTogglePin: () => void;
+  onToggleReaction: (emoji: ReactionEmoji) => void;
   onOpenImages: (urls: string[], index?: number) => void;
   onQuoteClick: (messageId: string) => void;
 };
@@ -34,6 +37,18 @@ type MessageImageGalleryProps = {
 
 function areStringArraysEqual(first: string[], second: string[]) {
   return first.length === second.length && first.every((value, index) => value === second[index]);
+}
+
+function areReactionsEqual(first: Message["reactions"], second: Message["reactions"]) {
+  return (
+    first.length === second.length &&
+    first.every(
+      (reaction, index) =>
+        reaction.id === second[index]?.id &&
+        reaction.sender === second[index]?.sender &&
+        reaction.emoji === second[index]?.emoji
+    )
+  );
 }
 
 function areMessageBubblePropsEqual(first: MessageBubbleProps, second: MessageBubbleProps) {
@@ -56,6 +71,9 @@ function areMessageBubblePropsEqual(first: MessageBubbleProps, second: MessageBu
     firstMessage.editedAt === secondMessage.editedAt &&
     firstMessage.recalledAt === secondMessage.recalledAt &&
     firstMessage.readAt === secondMessage.readAt &&
+    firstMessage.pinnedAt === secondMessage.pinnedAt &&
+    firstMessage.pinnedBy === secondMessage.pinnedBy &&
+    areReactionsEqual(firstMessage.reactions ?? [], secondMessage.reactions ?? []) &&
     firstMessage.clientStatus === secondMessage.clientStatus &&
     firstMessage.replyToMessageId === secondMessage.replyToMessageId &&
     firstReply?.id === secondReply?.id &&
@@ -154,6 +172,8 @@ function MessageBubbleComponent({
   onReply,
   onEdit,
   onRecall,
+  onTogglePin,
+  onToggleReaction,
   onOpenImages,
   onQuoteClick
 }: MessageBubbleProps) {
@@ -163,11 +183,15 @@ function MessageBubbleComponent({
   const editable = isOwn && !isClientOnly && canEditMessage(message.createdAt, message.recalledAt);
   const imageUrls = isRecalled ? [] : getMessageImageUrls(message);
   const hasVisibleContent = !isRecalled && (message.text || imageUrls.length > 0);
-  const hasStatus = Boolean(message.editedAt && !isRecalled) || Boolean(message.clientStatus);
+  const hasStatus = Boolean(message.editedAt && !isRecalled) || Boolean(message.clientStatus) || Boolean(message.pinnedAt);
   const showMeta = showTimestamp || hasStatus;
   const previewUrl = !isRecalled ? getFirstUrl(message.text) : null;
   const [isMenuOpen, setIsMenuOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement | null>(null);
+  const reactionGroups = REACTION_EMOJIS.map((emoji) => ({
+    emoji,
+    reactions: (message.reactions ?? []).filter((reaction) => reaction.emoji === emoji)
+  })).filter((group) => group.reactions.length > 0);
 
   useEffect(() => {
     if (!isMenuOpen) {
@@ -216,6 +240,9 @@ function MessageBubbleComponent({
               {showTimestamp ? <span>{isOwn ? "你" : SENDER_LABEL[message.sender]}</span> : null}
               {showTimestamp ? <span>{formatMessageTime(message.createdAt)}</span> : null}
               {message.editedAt && !isRecalled ? <span>已編輯</span> : null}
+              {message.pinnedAt && !isRecalled ? (
+                <span className="inline-flex items-center gap-1"><Pin size={11} />已置頂</span>
+              ) : null}
               {message.clientStatus === "sending" ? <span>傳送中</span> : null}
               {message.clientStatus === "failed" ? <span className="text-red-600">傳送失敗</span> : null}
             </div>
@@ -271,6 +298,33 @@ function MessageBubbleComponent({
 
             {!hasVisibleContent && !isRecalled ? <p className="text-sm text-slate-400">空訊息</p> : null}
           </div>
+          {!isRecalled && reactionGroups.length > 0 ? (
+            <div className={clsx("flex flex-wrap gap-1 px-1", isOwn ? "justify-end" : "justify-start")}>
+              {reactionGroups.map(({ emoji, reactions }) => {
+                const isSelected = reactions.some((reaction) => reaction.sender === currentSender);
+                const reactedBy = reactions.map((reaction) => SENDER_LABEL[reaction.sender]).join("、");
+
+                return (
+                  <button
+                    key={emoji}
+                    type="button"
+                    onClick={() => onToggleReaction(emoji)}
+                    aria-pressed={isSelected}
+                    title={reactedBy}
+                    className={clsx(
+                      "inline-flex h-7 items-center gap-1 rounded-md border px-2 text-xs transition",
+                      isSelected
+                        ? "border-brand bg-blue-50 text-brand"
+                        : "border-line bg-white text-slate-700 hover:border-slate-300"
+                    )}
+                  >
+                    <span>{emoji}</span>
+                    <span>{reactions.length}</span>
+                  </button>
+                );
+              })}
+            </div>
+          ) : null}
           {readReceipt ? (
             <div className={clsx("px-1 text-xs text-slate-500", isOwn ? "text-right" : "text-left")}>
               {readReceipt === "read" ? "已讀" : "未讀"}
@@ -302,11 +356,36 @@ function MessageBubbleComponent({
             {isMenuOpen ? (
               <div
                 className={clsx(
-                  "absolute bottom-10 z-10 min-w-28 rounded-lg border border-line bg-white p-1 text-sm shadow-soft",
+                  "absolute bottom-10 z-10 min-w-[216px] rounded-lg border border-line bg-white p-1 text-sm shadow-soft",
                   isOwn ? "right-0" : "left-0"
                 )}
                 onClick={(event) => event.stopPropagation()}
               >
+                {!isRecalled ? (
+                  <div className="mb-1 flex items-center justify-between gap-1 border-b border-line px-1 pb-1">
+                    {REACTION_EMOJIS.map((emoji) => {
+                      const isSelected = (message.reactions ?? []).some(
+                        (reaction) => reaction.sender === currentSender && reaction.emoji === emoji
+                      );
+
+                      return (
+                        <button
+                          key={emoji}
+                          type="button"
+                          onClick={() => runAction(() => onToggleReaction(emoji))}
+                          aria-label={`回應 ${emoji}`}
+                          aria-pressed={isSelected}
+                          className={clsx(
+                            "inline-flex h-8 w-8 items-center justify-center rounded-md text-base hover:bg-slate-100",
+                            isSelected && "bg-blue-50"
+                          )}
+                        >
+                          {emoji}
+                        </button>
+                      );
+                    })}
+                  </div>
+                ) : null}
                 <button
                   type="button"
                   onClick={() => runAction(onReply)}
@@ -314,6 +393,15 @@ function MessageBubbleComponent({
                 >
                   回覆
                 </button>
+                {!isRecalled ? (
+                  <button
+                    type="button"
+                    onClick={() => runAction(onTogglePin)}
+                    className="block w-full rounded-md px-3 py-2 text-left hover:bg-slate-50"
+                  >
+                    {message.pinnedAt ? "取消置頂" : "置頂"}
+                  </button>
+                ) : null}
                 {editable ? (
                   <button
                     type="button"

@@ -11,9 +11,25 @@ export type Message = {
   editedAt: string | null;
   recalledAt: string | null;
   readAt: string | null;
+  pinnedAt: string | null;
+  pinnedBy: Sender | null;
   replyToMessageId: string | null;
   replyTo?: ReplyMessage | null;
+  reactions: MessageReaction[];
   clientStatus?: "sending" | "failed";
+};
+
+export type MessageReaction = {
+  id: string;
+  sender: Sender;
+  emoji: string;
+  createdAt: string;
+};
+
+export type PresenceStatus = {
+  sender: Sender;
+  isOnline: boolean;
+  lastSeenAt: string | null;
 };
 
 export type ReplyMessage = {
