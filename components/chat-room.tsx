@@ -1,7 +1,7 @@
 "use client";
 
-import { ArrowLeft, RefreshCw } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ArrowDown, ArrowLeft, RefreshCw } from "lucide-react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ChatComposer, type ComposerPayload } from "@/components/chat-composer";
 import { ImageLightbox } from "@/components/image-lightbox";
 import { MessageBubble } from "@/components/message-bubble";
@@ -191,7 +191,13 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
   const [isOtherTyping, setIsOtherTyping] = useState(false);
   const [isPageActive, setIsPageActive] = useState(true);
   const [unreadCount, setUnreadCount] = useState(0);
-  const bottomRef = useRef<HTMLDivElement | null>(null);
+  const [unreadBelowCount, setUnreadBelowCount] = useState(0);
+  const [isAwayFromBottom, setIsAwayFromBottom] = useState(false);
+  const chatScrollRef = useRef<HTMLElement | null>(null);
+  const hasInitialScrolledRef = useRef(false);
+  const latestRenderedMessageIdRef = useRef<string | null>(null);
+  const scrollAnimationFrameRef = useRef<number | null>(null);
+  const unreadBelowCountRef = useRef(0);
   const loadMessagesPromiseRef = useRef<Promise<void> | null>(null);
   const optimisticImageUrlsRef = useRef<Map<string, string>>(new Map());
   const realtimeConnectedRef = useRef(false);
@@ -418,9 +424,108 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
     };
   }, []);
 
+  const clearUnreadBelow = useCallback(() => {
+    unreadBelowCountRef.current = 0;
+    setUnreadBelowCount(0);
+  }, []);
+
+  const scrollToLatest = useCallback(
+    (behavior: ScrollBehavior = "smooth") => {
+      const scrollContainer = chatScrollRef.current;
+
+      if (!scrollContainer) {
+        return;
+      }
+
+      scrollContainer.scrollTo({
+        top: scrollContainer.scrollHeight,
+        behavior
+      });
+      setIsAwayFromBottom(false);
+      clearUnreadBelow();
+    },
+    [clearUnreadBelow]
+  );
+
+  const handleChatScroll = useCallback(() => {
+    if (scrollAnimationFrameRef.current) {
+      return;
+    }
+
+    scrollAnimationFrameRef.current = window.requestAnimationFrame(() => {
+      scrollAnimationFrameRef.current = null;
+      const scrollContainer = chatScrollRef.current;
+
+      if (!scrollContainer) {
+        return;
+      }
+
+      const distanceFromBottom =
+        scrollContainer.scrollHeight - scrollContainer.scrollTop - scrollContainer.clientHeight;
+      const isAway = distanceFromBottom > 72;
+      setIsAwayFromBottom(isAway);
+
+      if (!isAway) {
+        clearUnreadBelow();
+      }
+    });
+  }, [clearUnreadBelow]);
+
+  useLayoutEffect(() => {
+    latestRenderedMessageIdRef.current = messages.at(-1)?.id ?? null;
+  }, [messages]);
+
+  useLayoutEffect(() => {
+    if (isLoading || hasInitialScrolledRef.current) {
+      return;
+    }
+
+    hasInitialScrolledRef.current = true;
+    const scrollContainer = chatScrollRef.current;
+    const initialLatestMessageId = latestRenderedMessageIdRef.current;
+    const stopInitialSettling = () => mutationObserver.disconnect();
+    const jumpToBottom = () => {
+      if (latestRenderedMessageIdRef.current !== initialLatestMessageId) {
+        stopInitialSettling();
+        return;
+      }
+
+      scrollToLatest("auto");
+    };
+    const mutationObserver = new MutationObserver(jumpToBottom);
+
+    if (scrollContainer) {
+      mutationObserver.observe(scrollContainer, { childList: true, subtree: true });
+      scrollContainer.addEventListener("wheel", stopInitialSettling, { once: true });
+      scrollContainer.addEventListener("touchstart", stopInitialSettling, { once: true });
+    }
+
+    let secondFrame = 0;
+    const firstFrame = window.requestAnimationFrame(() => {
+      jumpToBottom();
+      secondFrame = window.requestAnimationFrame(jumpToBottom);
+    });
+    const settleTimer = window.setTimeout(jumpToBottom, 300);
+    const observerTimer = window.setTimeout(stopInitialSettling, 1500);
+
+    return () => {
+      mutationObserver.disconnect();
+      scrollContainer?.removeEventListener("wheel", stopInitialSettling);
+      scrollContainer?.removeEventListener("touchstart", stopInitialSettling);
+      window.cancelAnimationFrame(firstFrame);
+      window.cancelAnimationFrame(secondFrame);
+      window.clearTimeout(settleTimer);
+      window.clearTimeout(observerTimer);
+    };
+  }, [isLoading, scrollToLatest]);
+
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: isLoading ? "auto" : "smooth" });
-  }, [messages.length, isLoading]);
+    return () => {
+      if (scrollAnimationFrameRef.current) {
+        window.cancelAnimationFrame(scrollAnimationFrameRef.current);
+      }
+    };
+  }, []);
 
   const editingLabel = useMemo(() => {
     if (!editing) {
@@ -475,6 +580,9 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
     }
 
     void playMessageNotificationSound();
+    unreadBelowCountRef.current += newIncomingMessageCount;
+    setUnreadBelowCount(unreadBelowCountRef.current);
+    setIsAwayFromBottom(true);
 
     if (!isPageActive) {
       setUnreadCount((currentCount) => currentCount + newIncomingMessageCount);
@@ -482,7 +590,7 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
   }, [isLoading, isPageActive, messages, sender]);
 
   useEffect(() => {
-    if (!isPageActive) {
+    if (!isPageActive || isAwayFromBottom || unreadBelowCountRef.current > 0) {
       return;
     }
 
@@ -527,7 +635,7 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
       .finally(() => {
         readSyncRef.current = false;
       });
-  }, [isPageActive, loadMessages, messages, sender]);
+  }, [isAwayFromBottom, isPageActive, loadMessages, messages, sender]);
 
   function focusMessage(messageId: string) {
     document.getElementById(`message-${messageId}`)?.scrollIntoView({
@@ -676,6 +784,7 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
         };
 
         setMessages((currentMessages) => sortMessagesByCreatedAt([...currentMessages, optimisticMessage]));
+        window.requestAnimationFrame(() => scrollToLatest("smooth"));
         setReplyTo(null);
 
         try {
@@ -797,7 +906,11 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
         </div>
       </header>
 
-      <section className="chat-scrollbar mx-auto flex min-h-0 w-full max-w-5xl flex-1 flex-col gap-4 overflow-y-auto px-3 py-5 sm:px-5">
+      <section
+        ref={chatScrollRef}
+        onScroll={handleChatScroll}
+        className="chat-scrollbar mx-auto flex min-h-0 w-full max-w-5xl flex-1 flex-col gap-4 overflow-y-auto px-3 py-5 sm:px-5"
+      >
         {isLoading ? (
           <div className="flex flex-1 items-center justify-center">
             <div className="h-10 w-10 animate-spin rounded-full border-2 border-line border-t-brand" />
@@ -843,8 +956,19 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
             {SENDER_LABEL[otherSender]} 正在輸入...
           </div>
         ) : null}
-        <div ref={bottomRef} />
       </section>
+
+      {isAwayFromBottom || unreadBelowCount > 0 ? (
+        <button
+          type="button"
+          onClick={() => scrollToLatest("smooth")}
+          className="fixed bottom-24 left-1/2 z-30 inline-flex h-10 -translate-x-1/2 items-center gap-2 rounded-md border border-line bg-white px-3 text-sm font-semibold text-slate-700 shadow-soft transition hover:border-brand hover:text-brand focus:outline-none focus:ring-4 focus:ring-brand/20"
+          aria-label={unreadBelowCount > 0 ? `${unreadBelowCount} 則未讀訊息，回到最新訊息` : "回到最新訊息"}
+        >
+          <ArrowDown size={16} />
+          {unreadBelowCount > 0 ? `${unreadBelowCount} 則未讀訊息` : "回到最新訊息"}
+        </button>
+      ) : null}
 
       {error ? (
         <div className="border-t border-red-100 bg-red-50 px-4 py-2 text-center text-sm text-red-700">{error}</div>
