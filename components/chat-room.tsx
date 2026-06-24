@@ -36,6 +36,8 @@ const MAX_PARALLEL_IMAGE_UPLOADS = 3;
 const JPEG_QUALITIES = [0.82, 0.74, 0.66, 0.58];
 const TYPING_IDLE_MS = 1200;
 const TYPING_EXPIRE_MS = 3200;
+const CHAT_BOTTOM_THRESHOLD_PX = 48;
+const CHAT_JUMP_BUTTON_THRESHOLD_PX = 180;
 
 function sortMessagesByCreatedAt(messages: Message[]) {
   return [...messages].sort((first, second) => new Date(first.createdAt).getTime() - new Date(second.createdAt).getTime());
@@ -205,6 +207,8 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
   const hasInitialScrolledRef = useRef(false);
   const latestRenderedMessageIdRef = useRef<string | null>(null);
   const scrollAnimationFrameRef = useRef<number | null>(null);
+  const programmaticScrollTimerRef = useRef<number | null>(null);
+  const isProgrammaticScrollRef = useRef(false);
   const unreadBelowCountRef = useRef(0);
   const loadMessagesPromiseRef = useRef<Promise<void> | null>(null);
   const optimisticImageUrlsRef = useRef<Map<string, string>>(new Map());
@@ -437,6 +441,24 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
     setUnreadBelowCount(0);
   }, []);
 
+  const stopProgrammaticScrollTracking = useCallback(() => {
+    isProgrammaticScrollRef.current = false;
+
+    if (programmaticScrollTimerRef.current) {
+      window.clearTimeout(programmaticScrollTimerRef.current);
+      programmaticScrollTimerRef.current = null;
+    }
+  }, []);
+
+  const startProgrammaticScrollTracking = useCallback(
+    (timeoutMs: number) => {
+      stopProgrammaticScrollTracking();
+      isProgrammaticScrollRef.current = true;
+      programmaticScrollTimerRef.current = window.setTimeout(stopProgrammaticScrollTracking, timeoutMs);
+    },
+    [stopProgrammaticScrollTracking]
+  );
+
   const scrollToLatest = useCallback(
     (behavior: ScrollBehavior = "smooth") => {
       const scrollContainer = chatScrollRef.current;
@@ -445,6 +467,7 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
         return;
       }
 
+      startProgrammaticScrollTracking(behavior === "smooth" ? 1200 : 100);
       scrollContainer.scrollTo({
         top: scrollContainer.scrollHeight,
         behavior
@@ -452,7 +475,7 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
       setIsAwayFromBottom(false);
       clearUnreadBelow();
     },
-    [clearUnreadBelow]
+    [clearUnreadBelow, startProgrammaticScrollTracking]
   );
 
   const handleChatScroll = useCallback(() => {
@@ -470,14 +493,22 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
 
       const distanceFromBottom =
         scrollContainer.scrollHeight - scrollContainer.scrollTop - scrollContainer.clientHeight;
-      const isAway = distanceFromBottom > 72;
-      setIsAwayFromBottom(isAway);
 
-      if (!isAway) {
+      if (isProgrammaticScrollRef.current) {
+        if (distanceFromBottom <= CHAT_BOTTOM_THRESHOLD_PX) {
+          stopProgrammaticScrollTracking();
+        }
+        return;
+      }
+
+      if (distanceFromBottom <= CHAT_BOTTOM_THRESHOLD_PX) {
+        setIsAwayFromBottom(false);
         clearUnreadBelow();
+      } else if (distanceFromBottom >= CHAT_JUMP_BUTTON_THRESHOLD_PX) {
+        setIsAwayFromBottom(true);
       }
     });
-  }, [clearUnreadBelow]);
+  }, [clearUnreadBelow, stopProgrammaticScrollTracking]);
 
   useLayoutEffect(() => {
     latestRenderedMessageIdRef.current = messages.at(-1)?.id ?? null;
@@ -532,8 +563,9 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
       if (scrollAnimationFrameRef.current) {
         window.cancelAnimationFrame(scrollAnimationFrameRef.current);
       }
+      stopProgrammaticScrollTracking();
     };
-  }, []);
+  }, [stopProgrammaticScrollTracking]);
 
   const editingLabel = useMemo(() => {
     if (!editing) {
@@ -587,6 +619,11 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
       return;
     }
 
+    const scrollContainer = chatScrollRef.current;
+    if (isProgrammaticScrollRef.current && scrollContainer) {
+      scrollContainer.scrollTo({ top: scrollContainer.scrollTop, behavior: "auto" });
+    }
+    stopProgrammaticScrollTracking();
     void playMessageNotificationSound();
     unreadBelowCountRef.current += newIncomingMessageCount;
     setUnreadBelowCount(unreadBelowCountRef.current);
@@ -595,7 +632,7 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
     if (!isPageActive) {
       setUnreadCount((currentCount) => currentCount + newIncomingMessageCount);
     }
-  }, [isLoading, isPageActive, messages, sender]);
+  }, [isLoading, isPageActive, messages, sender, stopProgrammaticScrollTracking]);
 
   useEffect(() => {
     if (!isPageActive || isAwayFromBottom || unreadBelowCountRef.current > 0) {
@@ -869,6 +906,7 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
       });
     }
 
+    startProgrammaticScrollTracking(1400);
     setMessages((currentMessages) => sortMessagesByCreatedAt([...currentMessages, ...optimisticMessages]));
     window.requestAnimationFrame(() => scrollToLatest("smooth"));
     setReplyTo(null);
@@ -991,6 +1029,13 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
       <section
         ref={chatScrollRef}
         onScroll={handleChatScroll}
+        onWheel={stopProgrammaticScrollTracking}
+        onTouchStart={stopProgrammaticScrollTracking}
+        onPointerDown={(event) => {
+          if (event.target === event.currentTarget) {
+            stopProgrammaticScrollTracking();
+          }
+        }}
         className="chat-scrollbar mx-auto flex min-h-0 w-full max-w-5xl flex-1 flex-col gap-4 overflow-y-auto px-3 py-5 sm:px-5"
       >
         {isLoading ? (
