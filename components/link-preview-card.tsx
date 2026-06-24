@@ -2,7 +2,7 @@
 
 /* eslint-disable @next/next/no-img-element */
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 type LinkPreview = {
   url: string;
@@ -54,9 +54,37 @@ function getCachedPreview(url: string) {
 export function LinkPreviewCard({ url }: LinkPreviewCardProps) {
   const [preview, setPreview] = useState<LinkPreview | null>(null);
   const [isUnavailable, setIsUnavailable] = useState(false);
+  const [visibleUrl, setVisibleUrl] = useState<string | null>(null);
+  const placeholderRef = useRef<HTMLSpanElement | null>(null);
 
   useEffect(() => {
     if (!url) {
+      return;
+    }
+
+    const placeholder = placeholderRef.current;
+
+    if (!placeholder || !("IntersectionObserver" in window)) {
+      setVisibleUrl(url);
+      return;
+    }
+
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        if (entry?.isIntersecting) {
+          setVisibleUrl(url);
+          observer.disconnect();
+        }
+      },
+      { rootMargin: "320px" }
+    );
+
+    observer.observe(placeholder);
+    return () => observer.disconnect();
+  }, [url]);
+
+  useEffect(() => {
+    if (!url || visibleUrl !== url) {
       setPreview(null);
       setIsUnavailable(false);
       return;
@@ -89,10 +117,14 @@ export function LinkPreviewCard({ url }: LinkPreviewCardProps) {
     return () => {
       isMounted = false;
     };
-  }, [url]);
+  }, [url, visibleUrl]);
 
-  if (!url || isUnavailable || !preview) {
+  if (!url || isUnavailable) {
     return null;
+  }
+
+  if (visibleUrl !== url || !preview) {
+    return <span ref={placeholderRef} className="mt-2 block h-px w-full" aria-hidden="true" />;
   }
 
   return (
@@ -103,7 +135,14 @@ export function LinkPreviewCard({ url }: LinkPreviewCardProps) {
       className="mt-2 block w-[min(70vw,420px)] overflow-hidden rounded-lg bg-white text-ink shadow-sm transition hover:brightness-95"
     >
       {preview.image ? (
-        <img src={preview.image} alt="" className="h-40 w-full bg-black object-cover" referrerPolicy="no-referrer" />
+        <img
+          src={preview.image}
+          alt=""
+          className="h-40 w-full bg-black object-cover"
+          loading="lazy"
+          decoding="async"
+          referrerPolicy="no-referrer"
+        />
       ) : null}
       <div className="space-y-1 p-3">
         {preview.title ? <p className="line-clamp-2 text-sm font-semibold leading-5">{preview.title}</p> : null}

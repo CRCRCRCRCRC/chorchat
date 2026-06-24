@@ -2,11 +2,11 @@
 
 import clsx from "clsx";
 import { Mic, MicOff, Phone, PhoneCall, PhoneOff, X } from "lucide-react";
-import Pusher from "pusher-js";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { playToneSequence, unlockAudio } from "@/lib/audio-client";
 import type { CallSignal, CallSignalType } from "@/lib/call";
-import { PUSHER_CHANNEL, PUSHER_EVENT_CALL_SIGNAL } from "@/lib/realtime";
+import { acquireRealtimeChannel } from "@/lib/pusher-client";
+import { PUSHER_EVENT_CALL_SIGNAL } from "@/lib/realtime";
 import { SENDER_LABEL, type Sender } from "@/lib/types";
 
 type CallStatus = "idle" | "calling" | "ringing" | "connecting" | "reconnecting" | "active";
@@ -69,9 +69,6 @@ export function VoiceCall({ sender, recipient }: VoiceCallProps) {
   const seenSignalIdsRef = useRef<Set<string>>(new Set());
   const lastSignalPollAtRef = useRef(new Date(Date.now() - 5000).toISOString());
   const pusherConnectedRef = useRef(false);
-
-  const pusherKey = process.env.NEXT_PUBLIC_PUSHER_KEY;
-  const pusherCluster = process.env.NEXT_PUBLIC_PUSHER_CLUSTER;
 
   useEffect(() => {
     statusRef.current = status;
@@ -591,31 +588,31 @@ export function VoiceCall({ sender, recipient }: VoiceCallProps) {
   );
 
   useEffect(() => {
-    if (!pusherKey || !pusherCluster) {
+    const realtimeLease = acquireRealtimeChannel();
+
+    if (!realtimeLease) {
       return;
     }
 
-    const pusher = new Pusher(pusherKey, {
-      cluster: pusherCluster
-    });
-    const channel = pusher.subscribe(PUSHER_CHANNEL);
+    const { pusher, channel } = realtimeLease;
+    pusherConnectedRef.current = pusher.connection.state === "connected";
     const handleStateChange = ({ current }: { current: string }) => {
       pusherConnectedRef.current = current === "connected";
     };
+    const handleCallSignal = (signal: CallSignal) => {
+      void receiveSignal(signal);
+    };
 
     pusher.connection.bind("state_change", handleStateChange);
-    channel.bind(PUSHER_EVENT_CALL_SIGNAL, (signal: CallSignal) => {
-      void receiveSignal(signal);
-    });
+    channel.bind(PUSHER_EVENT_CALL_SIGNAL, handleCallSignal);
 
     return () => {
       pusherConnectedRef.current = false;
       pusher.connection.unbind("state_change", handleStateChange);
-      channel.unbind(PUSHER_EVENT_CALL_SIGNAL);
-      pusher.unsubscribe(PUSHER_CHANNEL);
-      pusher.disconnect();
+      channel.unbind(PUSHER_EVENT_CALL_SIGNAL, handleCallSignal);
+      realtimeLease.release();
     };
-  }, [pusherCluster, pusherKey, receiveSignal]);
+  }, [receiveSignal]);
 
   useEffect(() => {
     let isStopped = false;

@@ -10,7 +10,7 @@ const messageInputSchema = z
     sender: z.enum(["CHEN", "ZUO"]),
     text: z.string().trim().max(4000).optional(),
     imageUrl: z.string().url().optional(),
-    imageUrls: z.array(z.string().url()).max(10).optional(),
+    imageUrls: z.array(z.string().url()).max(30).optional(),
     replyToMessageId: z.string().cuid().optional()
   })
   .refine((data) => Boolean(data.text?.trim() || data.imageUrl || data.imageUrls?.length), {
@@ -47,7 +47,7 @@ function getMessageInputs(data: z.infer<typeof createMessageSchema>) {
 
 function getImageUrls(message: MessageInput) {
   const urls = message.imageUrls?.length ? message.imageUrls : message.imageUrl ? [message.imageUrl] : [];
-  return urls.slice(0, 10);
+  return urls.slice(0, 30);
 }
 
 export async function GET() {

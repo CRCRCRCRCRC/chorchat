@@ -23,7 +23,7 @@ type ChatComposerProps = {
   onSubmit: (payload: ComposerPayload) => Promise<void>;
 };
 
-const MAX_SELECTED_IMAGES = 10;
+const MAX_SELECTED_IMAGES = 30;
 
 export function ChatComposer({
   isSending,
@@ -165,7 +165,12 @@ export function ChatComposer({
             <div className="flex gap-2 overflow-x-auto pb-1">
               {previewItems.map((item, index) => (
                 <div key={`${item.file.name}-${item.file.lastModified}-${index}`} className="relative h-20 w-20 shrink-0">
-                  <img src={item.url} alt="待傳送圖片預覽" className="h-20 w-20 rounded-md bg-white object-contain" />
+                  <img
+                    src={item.url}
+                    alt="待傳送圖片預覽"
+                    className="h-20 w-20 rounded-md bg-white object-contain"
+                    decoding="async"
+                  />
                   <button
                     type="button"
                     onClick={() => {

@@ -1,6 +1,5 @@
 "use client";
 
-import Pusher from "pusher-js";
 import { ArrowLeft, RefreshCw } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChatComposer, type ComposerPayload } from "@/components/chat-composer";
@@ -9,7 +8,8 @@ import { MessageBubble } from "@/components/message-bubble";
 import { VoiceCall } from "@/components/voice-call";
 import { playMessageNotificationSound, unlockAudio } from "@/lib/audio-client";
 import { clearBrowserUnreadBadge, updateBrowserUnreadBadge } from "@/lib/browser-badge";
-import { PUSHER_CHANNEL, PUSHER_EVENT_MESSAGES_CHANGED, PUSHER_EVENT_TYPING_CHANGED } from "@/lib/realtime";
+import { acquireRealtimeChannel } from "@/lib/pusher-client";
+import { PUSHER_EVENT_MESSAGES_CHANGED, PUSHER_EVENT_TYPING_CHANGED } from "@/lib/realtime";
 import { getMessageMinuteKey } from "@/lib/time";
 import { OTHER_SENDER, SENDER_LABEL, type Message, type Sender } from "@/lib/types";
 
@@ -24,6 +24,7 @@ const MESSAGE_REALTIME_BACKGROUND_POLLING_INTERVAL_MS = 60000;
 const MESSAGE_FALLBACK_BACKGROUND_POLLING_INTERVAL_MS = 5000;
 const MAX_SERVER_UPLOAD_BYTES = 4 * 1024 * 1024;
 const MAX_IMAGE_DIMENSION = 1800;
+const MAX_PARALLEL_IMAGE_UPLOADS = 3;
 const JPEG_QUALITIES = [0.82, 0.74, 0.66, 0.58];
 const TYPING_IDLE_MS = 1200;
 const TYPING_EXPIRE_MS = 3200;
@@ -158,6 +159,26 @@ async function readApiError(response: Response, fallback: string) {
   return typeof data?.error === "string" ? data.error : fallback;
 }
 
+async function mapWithConcurrency<T, TResult>(
+  items: T[],
+  concurrency: number,
+  mapper: (item: T, index: number) => Promise<TResult>
+) {
+  const results = new Array<TResult>(items.length);
+  let nextIndex = 0;
+
+  async function worker() {
+    while (nextIndex < items.length) {
+      const currentIndex = nextIndex;
+      nextIndex += 1;
+      results[currentIndex] = await mapper(items[currentIndex], currentIndex);
+    }
+  }
+
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, () => worker()));
+  return results;
+}
+
 export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [isLoading, setIsLoading] = useState(true);
@@ -269,8 +290,6 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
   }, []);
 
   useEffect(() => {
-    const key = process.env.NEXT_PUBLIC_PUSHER_KEY;
-    const cluster = process.env.NEXT_PUBLIC_PUSHER_CLUSTER;
     let timeoutId: number | null = null;
     let isStopped = false;
 
@@ -306,7 +325,9 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
 
     document.addEventListener("visibilitychange", handleVisibilityChange);
 
-    if (!key || !cluster) {
+    const realtimeLease = acquireRealtimeChannel();
+
+    if (!realtimeLease) {
       realtimeConnectedRef.current = false;
       schedulePoll();
 
@@ -320,8 +341,8 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
       };
     }
 
-    const pusher = new Pusher(key, { cluster });
-    const channel = pusher.subscribe(PUSHER_CHANNEL);
+    const { pusher, channel } = realtimeLease;
+    realtimeConnectedRef.current = pusher.connection.state === "connected";
     const handleStateChange = ({ current }: { current: string }) => {
       const isConnected = current === "connected";
       const wasConnected = realtimeConnectedRef.current;
@@ -331,13 +352,10 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
         schedulePoll(isConnected ? MESSAGE_REALTIME_HEALTH_CHECK_MS : 0);
       }
     };
-
-    pusher.connection.bind("state_change", handleStateChange);
-
-    channel.bind(PUSHER_EVENT_MESSAGES_CHANGED, () => {
+    const handleMessagesChanged = () => {
       void loadMessages().catch(() => undefined);
-    });
-    channel.bind(PUSHER_EVENT_TYPING_CHANGED, (event: { sender: Sender; isTyping: boolean }) => {
+    };
+    const handleTypingChanged = (event: { sender: Sender; isTyping: boolean }) => {
       if (event.sender === sender) {
         return;
       }
@@ -352,7 +370,11 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
       if (event.isTyping) {
         otherTypingTimerRef.current = window.setTimeout(() => setIsOtherTyping(false), TYPING_EXPIRE_MS);
       }
-    });
+    };
+
+    pusher.connection.bind("state_change", handleStateChange);
+    channel.bind(PUSHER_EVENT_MESSAGES_CHANGED, handleMessagesChanged);
+    channel.bind(PUSHER_EVENT_TYPING_CHANGED, handleTypingChanged);
     schedulePoll();
 
     return () => {
@@ -367,9 +389,9 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
         window.clearTimeout(otherTypingTimerRef.current);
       }
       pusher.connection.unbind("state_change", handleStateChange);
-      channel.unbind_all();
-      pusher.unsubscribe(PUSHER_CHANNEL);
-      pusher.disconnect();
+      channel.unbind(PUSHER_EVENT_MESSAGES_CHANGED, handleMessagesChanged);
+      channel.unbind(PUSHER_EVENT_TYPING_CHANGED, handleTypingChanged);
+      realtimeLease.release();
     };
   }, [loadMessages, sender]);
 
@@ -657,7 +679,11 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
         setReplyTo(null);
 
         try {
-          const uploadedImageUrls = await Promise.all(imageFiles.map((file) => uploadImage(file)));
+          const uploadedImageUrls = await mapWithConcurrency(
+            imageFiles,
+            MAX_PARALLEL_IMAGE_UPLOADS,
+            (file) => uploadImage(file)
+          );
 
           const response = await fetch("/api/messages", {
             method: "POST",
@@ -724,9 +750,7 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
         throw new Error("收回失敗");
       }
 
-      if (editing?.id === message.id) {
-        setEditing(null);
-      }
+      setEditing((currentEditing) => (currentEditing?.id === message.id ? null : currentEditing));
 
       await loadMessages();
     } catch (recallError) {

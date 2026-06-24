@@ -4,7 +4,7 @@
 
 import clsx from "clsx";
 import { MoreHorizontal } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { LinkifiedText } from "@/components/linkified-text";
 import { LinkPreviewCard } from "@/components/link-preview-card";
 import { getFirstUrl } from "@/lib/links";
@@ -25,14 +25,50 @@ type MessageBubbleProps = {
   onQuoteClick: (messageId: string) => void;
 };
 
-type MessageImageStackProps = {
+type MessageImageGalleryProps = {
   imageUrls: string[];
   isOwn: boolean;
   senderLabel: string;
   onOpenImages: (urls: string[], index?: number) => void;
 };
 
-function MessageImageStack({ imageUrls, isOwn, senderLabel, onOpenImages }: MessageImageStackProps) {
+function areStringArraysEqual(first: string[], second: string[]) {
+  return first.length === second.length && first.every((value, index) => value === second[index]);
+}
+
+function areMessageBubblePropsEqual(first: MessageBubbleProps, second: MessageBubbleProps) {
+  const firstMessage = first.message;
+  const secondMessage = second.message;
+  const firstReply = firstMessage.replyTo;
+  const secondReply = secondMessage.replyTo;
+
+  return (
+    first.currentSender === second.currentSender &&
+    first.isHighlighted === second.isHighlighted &&
+    first.showTimestamp === second.showTimestamp &&
+    first.readReceipt === second.readReceipt &&
+    firstMessage.id === secondMessage.id &&
+    firstMessage.sender === secondMessage.sender &&
+    firstMessage.text === secondMessage.text &&
+    firstMessage.imageUrl === secondMessage.imageUrl &&
+    areStringArraysEqual(firstMessage.imageUrls ?? [], secondMessage.imageUrls ?? []) &&
+    firstMessage.updatedAt === secondMessage.updatedAt &&
+    firstMessage.editedAt === secondMessage.editedAt &&
+    firstMessage.recalledAt === secondMessage.recalledAt &&
+    firstMessage.readAt === secondMessage.readAt &&
+    firstMessage.clientStatus === secondMessage.clientStatus &&
+    firstMessage.replyToMessageId === secondMessage.replyToMessageId &&
+    firstReply?.id === secondReply?.id &&
+    firstReply?.sender === secondReply?.sender &&
+    firstReply?.text === secondReply?.text &&
+    firstReply?.imageUrl === secondReply?.imageUrl &&
+    firstReply?.editedAt === secondReply?.editedAt &&
+    firstReply?.recalledAt === secondReply?.recalledAt &&
+    areStringArraysEqual(firstReply?.imageUrls ?? [], secondReply?.imageUrls ?? [])
+  );
+}
+
+function MessageImageGallery({ imageUrls, isOwn, senderLabel, onOpenImages }: MessageImageGalleryProps) {
   if (imageUrls.length === 0) {
     return null;
   }
@@ -49,49 +85,67 @@ function MessageImageStack({ imageUrls, isOwn, senderLabel, onOpenImages }: Mess
           src={imageUrls[0]}
           alt="聊天圖片"
           className="h-[220px] w-[min(70vw,360px)] rounded-md object-contain sm:h-[240px]"
+          loading="lazy"
+          decoding="async"
         />
       </button>
     );
   }
 
-  const visibleBackCards = Math.min(imageUrls.length - 1, 3);
-  const previewUrl = imageUrls[0];
+  const visibleImages = imageUrls.slice(0, 4);
+  const galleryClass =
+    imageUrls.length === 2
+      ? "h-[220px] grid-cols-2 grid-rows-1 sm:h-[240px]"
+      : "h-[260px] grid-cols-2 grid-rows-2 sm:h-[300px]";
 
   return (
     <div className="mb-2">
       <p className={clsx("mb-1 px-1 text-sm", isOwn ? "text-white/90" : "text-slate-600")}>
         {senderLabel}傳送了 {imageUrls.length} 張相片
       </p>
-      <button
-        type="button"
-        onClick={() => onOpenImages(imageUrls, 0)}
-        className="relative block h-[220px] w-[min(70vw,260px)] focus:outline-none focus:ring-4 focus:ring-brand/20 sm:h-[240px] sm:w-[280px]"
-        aria-label={`開啟 ${imageUrls.length} 張相片`}
+      <div
+        className={clsx(
+          "grid w-[min(76vw,380px)] gap-1 overflow-hidden rounded-md",
+          galleryClass
+        )}
       >
-        {Array.from({ length: visibleBackCards }).map((_, index) => (
-          <span
-            key={index}
-            className="absolute inset-0 rounded-lg border border-white/70 bg-green-500 shadow-sm"
-            style={{
-              transform: `translate(${(visibleBackCards - index) * 8}px, -${(visibleBackCards - index) * 7}px) rotate(${
-                4 - index * 2
-              }deg)`,
-              opacity: 0.78 - index * 0.12
-            }}
-          />
-        ))}
-        <span className="absolute inset-0 overflow-hidden rounded-lg border border-white/80 bg-green-500 p-2 shadow-sm">
-          <img src={previewUrl} alt="相片堆疊預覽" className="h-full w-full rounded-md object-contain" />
-        </span>
-        <span className="absolute bottom-2 right-2 rounded-md bg-black/65 px-2 py-1 text-xs font-semibold text-white">
-          +{imageUrls.length - 1}
-        </span>
-      </button>
+        {visibleImages.map((imageUrl, index) => {
+          const isLargeFirstImage = imageUrls.length === 3 && index === 0;
+          const remainingCount = imageUrls.length - visibleImages.length;
+          const showRemainingCount = index === 3 && remainingCount > 0;
+
+          return (
+            <button
+              key={`${imageUrl}-${index}`}
+              type="button"
+              onClick={() => onOpenImages(imageUrls, index)}
+              className={clsx(
+                "relative min-h-0 overflow-hidden bg-black/10 focus:outline-none focus:ring-4 focus:ring-inset focus:ring-brand/30",
+                isLargeFirstImage && "row-span-2"
+              )}
+              aria-label={`開啟第 ${index + 1} 張相片，共 ${imageUrls.length} 張`}
+            >
+              <img
+                src={imageUrl}
+                alt={`聊天相片 ${index + 1}`}
+                className="h-full w-full object-contain"
+                loading="lazy"
+                decoding="async"
+              />
+              {showRemainingCount ? (
+                <span className="absolute inset-0 flex items-center justify-center bg-black/55 text-2xl font-semibold text-white">
+                  +{remainingCount}
+                </span>
+              ) : null}
+            </button>
+          );
+        })}
+      </div>
     </div>
   );
 }
 
-export function MessageBubble({
+function MessageBubbleComponent({
   message,
   currentSender,
   isHighlighted,
@@ -192,6 +246,8 @@ export function MessageBubble({
                     src={getMessageImageUrls(message.replyTo)[0]}
                     alt="回覆圖片縮圖"
                     className="h-9 w-9 shrink-0 rounded-md object-contain"
+                    loading="lazy"
+                    decoding="async"
                   />
                 ) : null}
                 <span className="min-w-0 truncate">{getReplyPreview(message.replyTo)}</span>
@@ -202,7 +258,7 @@ export function MessageBubble({
               <p className="text-sm italic">{isOwn ? "你已收回一則訊息" : "對方已收回一則訊息"}</p>
             ) : null}
 
-            <MessageImageStack
+            <MessageImageGallery
               imageUrls={imageUrls}
               isOwn={isOwn}
               senderLabel={isOwn ? "你" : SENDER_LABEL[message.sender]}
@@ -284,3 +340,5 @@ export function MessageBubble({
     </article>
   );
 }
+
+export const MessageBubble = memo(MessageBubbleComponent, areMessageBubblePropsEqual);
