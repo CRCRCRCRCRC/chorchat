@@ -146,7 +146,7 @@ export function ChatComposer({
             <div className="mb-2 flex items-center justify-between gap-3 text-sm text-slate-600">
               <p>
                 已選擇 {previewItems.length} 張圖片
-                {text.trim() ? "，文字會放在第一張" : ""}
+                {text.trim() ? "，文字與圖片會分開傳送" : ""}
               </p>
               <button
                 type="button"

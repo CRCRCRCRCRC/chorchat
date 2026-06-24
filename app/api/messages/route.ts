@@ -1,4 +1,4 @@
-import { NextResponse } from "next/server";
+import { after, NextResponse } from "next/server";
 import { z } from "zod";
 import { prisma } from "@/lib/prisma";
 import { notifyMessagesChanged } from "@/lib/pusher-server";
@@ -50,6 +50,21 @@ function getImageUrls(message: MessageInput) {
   return urls.slice(0, 30);
 }
 
+function createStoredMessage(message: MessageInput) {
+  const imageUrls = getImageUrls(message);
+
+  return prisma.message.create({
+    data: {
+      imageUrls,
+      sender: message.sender,
+      text: message.text?.trim() || null,
+      imageUrl: imageUrls[0] ?? null,
+      replyToMessageId: message.replyToMessageId ?? null
+    },
+    include: messageInclude
+  });
+}
+
 export async function GET() {
   const messages = await prisma.message.findMany({
     orderBy: {
@@ -92,22 +107,12 @@ export async function POST(request: Request) {
     }
   }
 
-  const messages = await prisma.$transaction(
-    messageInputs.map((message: MessageInput) =>
-      prisma.message.create({
-        data: {
-          imageUrls: getImageUrls(message),
-          sender: message.sender,
-          text: message.text?.trim() || null,
-          imageUrl: getImageUrls(message)[0] ?? null,
-          replyToMessageId: message.replyToMessageId ?? null
-        },
-        include: messageInclude
-      })
-    )
-  );
+  const messages =
+    messageInputs.length === 1
+      ? [await createStoredMessage(messageInputs[0])]
+      : await prisma.$transaction(messageInputs.map(createStoredMessage));
 
-  await notifyMessagesChanged({ type: "created", id: messages[0]?.id });
+  after(() => notifyMessagesChanged({ type: "created", id: messages[0]?.id }));
 
   if ("messages" in parsed.data) {
     return NextResponse.json({ messages }, { status: 201 });

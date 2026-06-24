@@ -18,6 +18,14 @@ type ChatRoomProps = {
   onSwitchIdentity: () => void;
 };
 
+type CreateMessageRequest = {
+  sender: Sender;
+  text?: string;
+  imageUrl?: string;
+  imageUrls?: string[];
+  replyToMessageId?: string;
+};
+
 const MESSAGE_FALLBACK_POLLING_INTERVAL_MS = 1500;
 const MESSAGE_REALTIME_HEALTH_CHECK_MS = 15000;
 const MESSAGE_REALTIME_BACKGROUND_POLLING_INTERVAL_MS = 60000;
@@ -664,6 +672,48 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
     return data.url;
   }
 
+  async function persistOptimisticMessage(
+    tempId: string,
+    requestBody: CreateMessageRequest,
+    localImageCount = 0
+  ) {
+    const response = await fetch("/api/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(requestBody)
+    });
+
+    if (!response.ok) {
+      throw new Error(await readApiError(response, "訊息送出失敗"));
+    }
+
+    const data = (await response.json()) as { message: Message };
+
+    for (let index = 0; index < localImageCount; index += 1) {
+      const optimisticImageUrl = optimisticImageUrlsRef.current.get(`${tempId}-${index}`);
+
+      if (optimisticImageUrl) {
+        URL.revokeObjectURL(optimisticImageUrl);
+        optimisticImageUrlsRef.current.delete(`${tempId}-${index}`);
+      }
+    }
+
+    setMessages((currentMessages) =>
+      sortMessagesByCreatedAt([
+        ...currentMessages.filter((message) => message.id !== tempId && message.id !== data.message.id),
+        data.message
+      ])
+    );
+  }
+
+  function markOptimisticMessageFailed(tempId: string) {
+    setMessages((currentMessages) =>
+      currentMessages.map((message) => (message.id === tempId ? { ...message, clientStatus: "failed" } : message))
+    );
+  }
+
   const sendTypingState = useCallback(
     async (isTyping: boolean) => {
       await fetch("/api/typing", {
@@ -712,14 +762,14 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
 
   async function handleSubmit(payload: ComposerPayload) {
     handleTypingActivity(false);
-    setIsSending(true);
     setError(null);
 
-    try {
-      if (editing) {
-        const editingMessage = editing;
-        const editedAt = new Date().toISOString();
+    if (editing) {
+      const editingMessage = editing;
+      const editedAt = new Date().toISOString();
+      setIsSending(true);
 
+      try {
         setEditing(null);
         setMessages((currentMessages) =>
           currentMessages.map((message) =>
@@ -757,89 +807,121 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
           currentMessages.map((message) => (message.id === editingMessage.id ? data.message : message))
         );
         void loadMessages().catch(() => undefined);
-      } else {
-        const imageFiles = payload.files;
-        const now = new Date().toISOString();
-        const replyTarget = replyTo;
-        const tempId = getOptimisticId();
-        const localImageUrls = imageFiles.map((file, index) => {
-          const localImageUrl = URL.createObjectURL(file);
-          optimisticImageUrlsRef.current.set(`${tempId}-${index}`, localImageUrl);
-          return localImageUrl;
-        });
-        const optimisticMessage: Message = {
-          id: tempId,
+      } catch (submitError) {
+        setError(submitError instanceof Error ? submitError.message : "操作失敗");
+      } finally {
+        setIsSending(false);
+      }
+
+      return;
+    }
+
+    const text = payload.text.trim();
+    const imageFiles = payload.files;
+    const replyTarget = replyTo;
+    const createdAt = Date.now();
+    const optimisticMessages: Message[] = [];
+    const textTempId = text ? getOptimisticId() : null;
+    const imageTempId = imageFiles.length > 0 ? getOptimisticId() : null;
+    let localImageUrls: string[] = [];
+
+    if (textTempId) {
+      optimisticMessages.push({
+        id: textTempId,
+        sender,
+        text,
+        imageUrl: null,
+        imageUrls: [],
+        createdAt: new Date(createdAt).toISOString(),
+        updatedAt: new Date(createdAt).toISOString(),
+        editedAt: null,
+        recalledAt: null,
+        readAt: null,
+        replyToMessageId: replyTarget?.id ?? null,
+        replyTo: replyTarget ? toReplyMessage(replyTarget) : null,
+        clientStatus: "sending"
+      });
+    }
+
+    if (imageTempId) {
+      localImageUrls = imageFiles.map((file, index) => {
+        const localImageUrl = URL.createObjectURL(file);
+        optimisticImageUrlsRef.current.set(`${imageTempId}-${index}`, localImageUrl);
+        return localImageUrl;
+      });
+      const imageCreatedAt = createdAt + (textTempId ? 1 : 0);
+      const imageReplyTarget = textTempId ? null : replyTarget;
+
+      optimisticMessages.push({
+        id: imageTempId,
+        sender,
+        text: null,
+        imageUrl: localImageUrls[0] ?? null,
+        imageUrls: localImageUrls,
+        createdAt: new Date(imageCreatedAt).toISOString(),
+        updatedAt: new Date(imageCreatedAt).toISOString(),
+        editedAt: null,
+        recalledAt: null,
+        readAt: null,
+        replyToMessageId: imageReplyTarget?.id ?? null,
+        replyTo: imageReplyTarget ? toReplyMessage(imageReplyTarget) : null,
+        clientStatus: "sending"
+      });
+    }
+
+    setMessages((currentMessages) => sortMessagesByCreatedAt([...currentMessages, ...optimisticMessages]));
+    window.requestAnimationFrame(() => scrollToLatest("smooth"));
+    setReplyTo(null);
+
+    const imageUploadTask: Promise<{ urls: string[]; error: unknown | null }> =
+      imageFiles.length > 0
+        ? mapWithConcurrency(imageFiles, MAX_PARALLEL_IMAGE_UPLOADS, (file) => uploadImage(file)).then(
+            (urls) => ({ urls, error: null }),
+            (error: unknown) => ({ urls: [], error })
+          )
+        : Promise.resolve({ urls: [], error: null });
+    let firstError: unknown = null;
+
+    if (textTempId) {
+      try {
+        await persistOptimisticMessage(textTempId, {
           sender,
-          text: payload.text || null,
-          imageUrl: localImageUrls[0] ?? null,
-          imageUrls: localImageUrls,
-          createdAt: now,
-          updatedAt: now,
-          editedAt: null,
-          recalledAt: null,
-          readAt: null,
-          replyToMessageId: replyTarget?.id ?? null,
-          replyTo: replyTarget ? toReplyMessage(replyTarget) : null,
-          clientStatus: "sending"
-        };
+          text,
+          replyToMessageId: replyTarget?.id
+        });
+      } catch (sendError) {
+        markOptimisticMessageFailed(textTempId);
+        firstError = sendError;
+      }
+    }
 
-        setMessages((currentMessages) => sortMessagesByCreatedAt([...currentMessages, optimisticMessage]));
-        window.requestAnimationFrame(() => scrollToLatest("smooth"));
-        setReplyTo(null);
+    if (imageTempId) {
+      const uploadResult = await imageUploadTask;
 
+      if (uploadResult.error) {
+        markOptimisticMessageFailed(imageTempId);
+        firstError ??= uploadResult.error;
+      } else {
         try {
-          const uploadedImageUrls = await mapWithConcurrency(
-            imageFiles,
-            MAX_PARALLEL_IMAGE_UPLOADS,
-            (file) => uploadImage(file)
-          );
-
-          const response = await fetch("/api/messages", {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json"
-            },
-            body: JSON.stringify({
+          await persistOptimisticMessage(
+            imageTempId,
+            {
               sender,
-              text: payload.text || undefined,
-              imageUrl: uploadedImageUrls[0],
-              imageUrls: uploadedImageUrls,
-              replyToMessageId: replyTarget?.id
-            })
-          });
-
-          if (!response.ok) {
-            throw new Error("訊息送出失敗");
-          }
-
-          const data = (await response.json()) as { message: Message };
-
-          localImageUrls.forEach((_, index) => {
-            const optimisticImageUrl = optimisticImageUrlsRef.current.get(`${tempId}-${index}`);
-            if (optimisticImageUrl) {
-              URL.revokeObjectURL(optimisticImageUrl);
-              optimisticImageUrlsRef.current.delete(`${tempId}-${index}`);
-            }
-          });
-
-          setMessages((currentMessages) =>
-            sortMessagesByCreatedAt([
-              ...currentMessages.filter((message) => message.id !== tempId && message.id !== data.message.id),
-              data.message
-            ])
+              imageUrl: uploadResult.urls[0],
+              imageUrls: uploadResult.urls,
+              replyToMessageId: textTempId ? undefined : replyTarget?.id
+            },
+            localImageUrls.length
           );
-          void loadMessages().catch(() => undefined);
         } catch (sendError) {
-          setMessages((currentMessages) =>
-            currentMessages.map((message) => (message.id === tempId ? { ...message, clientStatus: "failed" } : message))
-          );
-          throw sendError;
+          markOptimisticMessageFailed(imageTempId);
+          firstError ??= sendError;
         }
       }
-    } catch (submitError) {
-      setError(submitError instanceof Error ? submitError.message : "操作失敗");
-    } finally {
-      setIsSending(false);
+    }
+
+    if (firstError) {
+      setError(firstError instanceof Error ? firstError.message : "訊息送出失敗");
     }
   }
 
