@@ -1,6 +1,6 @@
 "use client";
 
-import { ArrowDown, ArrowLeft, Images, Pin, RefreshCw, Search } from "lucide-react";
+import { ArrowDown, ArrowDownToLine, ArrowLeft, Images, Pin, RefreshCw, Search } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ChatComposer, type ComposerPayload } from "@/components/chat-composer";
 import { ChatToolsDialog, type ChatToolMode } from "@/components/chat-tools-dialog";
@@ -41,6 +41,7 @@ const TYPING_IDLE_MS = 1200;
 const TYPING_EXPIRE_MS = 3200;
 const CHAT_BOTTOM_THRESHOLD_PX = 48;
 const CHAT_JUMP_BUTTON_THRESHOLD_PX = 180;
+const AUTO_SCROLL_STORAGE_PREFIX = "chorchat:auto-scroll";
 
 function sortMessagesByCreatedAt(messages: Message[]) {
   return [...messages].sort((first, second) => new Date(first.createdAt).getTime() - new Date(second.createdAt).getTime());
@@ -216,6 +217,7 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
   const [unreadBelowCount, setUnreadBelowCount] = useState(0);
   const [isAwayFromBottom, setIsAwayFromBottom] = useState(false);
   const [activeTool, setActiveTool] = useState<ChatToolMode | null>(null);
+  const [autoScrollOnIncoming, setAutoScrollOnIncoming] = useState(false);
   const chatScrollRef = useRef<HTMLElement | null>(null);
   const hasInitialScrolledRef = useRef(false);
   const latestRenderedMessageIdRef = useRef<string | null>(null);
@@ -239,6 +241,18 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
     () => messages.filter((message) => message.pinnedAt && !message.recalledAt && !message.clientStatus).length,
     [messages]
   );
+
+  useEffect(() => {
+    setAutoScrollOnIncoming(window.localStorage.getItem(`${AUTO_SCROLL_STORAGE_PREFIX}:${sender}`) === "true");
+  }, [sender]);
+
+  function toggleAutoScrollOnIncoming() {
+    setAutoScrollOnIncoming((currentValue) => {
+      const nextValue = !currentValue;
+      window.localStorage.setItem(`${AUTO_SCROLL_STORAGE_PREFIX}:${sender}`, String(nextValue));
+      return nextValue;
+    });
+  }
 
   const loadMessages = useCallback(async () => {
     if (loadMessagesPromiseRef.current) {
@@ -637,20 +651,33 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
       return;
     }
 
-    const scrollContainer = chatScrollRef.current;
-    if (isProgrammaticScrollRef.current && scrollContainer) {
-      scrollContainer.scrollTo({ top: scrollContainer.scrollTop, behavior: "auto" });
-    }
-    stopProgrammaticScrollTracking();
     void playMessageNotificationSound();
-    unreadBelowCountRef.current += newIncomingMessageCount;
-    setUnreadBelowCount(unreadBelowCountRef.current);
-    setIsAwayFromBottom(true);
+
+    if (autoScrollOnIncoming) {
+      scrollToLatest("smooth");
+    } else {
+      const scrollContainer = chatScrollRef.current;
+      if (isProgrammaticScrollRef.current && scrollContainer) {
+        scrollContainer.scrollTo({ top: scrollContainer.scrollTop, behavior: "auto" });
+      }
+      stopProgrammaticScrollTracking();
+      unreadBelowCountRef.current += newIncomingMessageCount;
+      setUnreadBelowCount(unreadBelowCountRef.current);
+      setIsAwayFromBottom(true);
+    }
 
     if (!isPageActive) {
       setUnreadCount((currentCount) => currentCount + newIncomingMessageCount);
     }
-  }, [isLoading, isPageActive, messages, sender, stopProgrammaticScrollTracking]);
+  }, [
+    autoScrollOnIncoming,
+    isLoading,
+    isPageActive,
+    messages,
+    scrollToLatest,
+    sender,
+    stopProgrammaticScrollTracking
+  ]);
 
   useEffect(() => {
     if (!isPageActive || isAwayFromBottom || unreadBelowCountRef.current > 0) {
@@ -1136,7 +1163,7 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
           </div>
         </div>
         <nav className="border-t border-line/80 px-3 py-2" aria-label="聊天室工具">
-          <div className="mx-auto grid max-w-5xl grid-cols-3 gap-2">
+          <div className="mx-auto grid max-w-5xl grid-cols-4 gap-1 sm:gap-2">
             <button
               type="button"
               onClick={() => setActiveTool("search")}
@@ -1162,6 +1189,19 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
                   {pinnedMessageCount}
                 </span>
               ) : null}
+            </button>
+            <button
+              type="button"
+              onClick={toggleAutoScrollOnIncoming}
+              aria-pressed={autoScrollOnIncoming}
+              aria-label={`新訊息自動滑到底：${autoScrollOnIncoming ? "已開啟" : "已關閉"}`}
+              className={`inline-flex h-9 items-center justify-center gap-1.5 rounded-md text-sm font-medium transition ${
+                autoScrollOnIncoming
+                  ? "bg-blue-50 text-brand"
+                  : "text-slate-600 hover:bg-slate-100 hover:text-ink"
+              }`}
+            >
+              <ArrowDownToLine size={16} />自動{autoScrollOnIncoming ? "開" : "關"}
             </button>
           </div>
         </nav>
