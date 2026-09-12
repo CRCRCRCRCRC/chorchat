@@ -81,7 +81,7 @@ npm run dev
 1. 將專案推到 GitHub。
 2. 建立 Neon PostgreSQL database，取得 `DATABASE_URL`。
 3. 在 Vercel 建立 Blob store，取得 `BLOB_READ_WRITE_TOKEN`。
-4. 建立 Pusher Channels app，取得 app id、key、secret、cluster。
+4. 建立 Pusher Channels app，取得 app id、key、secret、cluster，並在 App Settings 開啟 `Enable client events`。
 5. 在 Vercel 匯入 GitHub repo。
 6. 到 Vercel Project Settings 加入 `.env.example` 中的環境變數。
 7. 務必設定 `CHORCHAT_AUTH_PASSWORD`，避免公開網址被其他人直接進聊天室或呼叫 API。

@@ -21,7 +21,13 @@ export function acquireRealtimeChannel() {
     disconnectTimer = null;
   }
 
-  sharedPusher ??= new Pusher(key, { cluster });
+  sharedPusher ??= new Pusher(key, {
+    cluster,
+    channelAuthorization: {
+      endpoint: "/api/pusher/auth",
+      transport: "ajax"
+    }
+  });
   sharedChannel ??= sharedPusher.subscribe(PUSHER_CHANNEL);
   consumerCount += 1;
   let isReleased = false;
@@ -53,4 +59,17 @@ export function acquireRealtimeChannel() {
       }, 1000);
     }
   };
+}
+
+export function triggerRealtimeClientEvent(eventName: string, payload: Record<string, unknown>) {
+  if (!sharedChannel?.subscribed) {
+    return false;
+  }
+
+  try {
+    return sharedChannel.trigger(eventName, payload);
+  } catch (error) {
+    console.error("Realtime client event failed", error);
+    return false;
+  }
 }

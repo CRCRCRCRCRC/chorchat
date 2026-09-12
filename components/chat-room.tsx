@@ -10,11 +10,15 @@ import { VoiceCall } from "@/components/voice-call";
 import { playMessageNotificationSound, unlockAudio } from "@/lib/audio-client";
 import { clearBrowserUnreadBadge, updateBrowserUnreadBadge } from "@/lib/browser-badge";
 import { formatPresence, usePresence } from "@/lib/presence-client";
-import { acquireRealtimeChannel } from "@/lib/pusher-client";
+import { acquireRealtimeChannel, triggerRealtimeClientEvent } from "@/lib/pusher-client";
 import type { ReactionEmoji } from "@/lib/reactions";
 import {
+  PUSHER_EVENT_CLIENT_MESSAGE_FAILED,
+  PUSHER_EVENT_CLIENT_MESSAGE_PREVIEW,
   PUSHER_EVENT_MESSAGES_CHANGED,
   PUSHER_EVENT_TYPING_CHANGED,
+  type ClientMessageFailedEvent,
+  type ClientMessagePreviewEvent,
   type MessagesChangedEvent
 } from "@/lib/realtime";
 import { getMessageMinuteKey } from "@/lib/time";
@@ -466,7 +470,13 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
             const replacedClientIds = event.clientIds ?? (event.clientId ? [event.clientId] : []);
 
             if (replacedClientIds.length > 0) {
-              incomingMessages.forEach((message) => knownMessageIdsRef.current.add(message.id));
+              incomingMessages.forEach((message, index) => {
+                const replacedClientId = replacedClientIds[index];
+
+                if (replacedClientId && knownMessageIdsRef.current.has(replacedClientId)) {
+                  knownMessageIdsRef.current.add(message.id);
+                }
+              });
             }
 
             setMessages((currentMessages) =>
@@ -499,10 +509,28 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
         otherTypingTimerRef.current = window.setTimeout(() => setIsOtherTyping(false), TYPING_EXPIRE_MS);
       }
     };
+    const handleClientMessagePreview = (event: ClientMessagePreviewEvent) => {
+      const incomingMessages = event.messages.filter((message) => message.sender !== sender);
+
+      if (incomingMessages.length > 0) {
+        setMessages((currentMessages) => mergeRealtimeMessages(currentMessages, incomingMessages));
+      }
+    };
+    const handleClientMessageFailed = (event: ClientMessageFailedEvent) => {
+      const failedClientIds = new Set(event.clientIds);
+
+      if (failedClientIds.size > 0) {
+        setMessages((currentMessages) =>
+          currentMessages.filter((message) => !failedClientIds.has(message.id))
+        );
+      }
+    };
 
     pusher.connection.bind("state_change", handleStateChange);
     channel.bind(PUSHER_EVENT_MESSAGES_CHANGED, handleMessagesChanged);
     channel.bind(PUSHER_EVENT_TYPING_CHANGED, handleTypingChanged);
+    channel.bind(PUSHER_EVENT_CLIENT_MESSAGE_PREVIEW, handleClientMessagePreview);
+    channel.bind(PUSHER_EVENT_CLIENT_MESSAGE_FAILED, handleClientMessageFailed);
     schedulePoll();
 
     return () => {
@@ -519,6 +547,8 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
       pusher.connection.unbind("state_change", handleStateChange);
       channel.unbind(PUSHER_EVENT_MESSAGES_CHANGED, handleMessagesChanged);
       channel.unbind(PUSHER_EVENT_TYPING_CHANGED, handleTypingChanged);
+      channel.unbind(PUSHER_EVENT_CLIENT_MESSAGE_PREVIEW, handleClientMessagePreview);
+      channel.unbind(PUSHER_EVENT_CLIENT_MESSAGE_FAILED, handleClientMessageFailed);
       realtimeLease.release();
     };
   }, [loadMessages, sender]);
@@ -1040,6 +1070,13 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
     window.requestAnimationFrame(() => scrollToLatest("smooth"));
     setReplyTo(null);
 
+    const instantTextMessages = optimisticMessages.filter((message) => Boolean(message.text));
+    if (instantTextMessages.length > 0) {
+      triggerRealtimeClientEvent(PUSHER_EVENT_CLIENT_MESSAGE_PREVIEW, {
+        messages: instantTextMessages
+      });
+    }
+
     const imageUploadTask: Promise<{ urls: string[]; error: unknown | null }> =
       imageFiles.length > 0
         ? mapWithConcurrency(imageFiles, MAX_PARALLEL_IMAGE_UPLOADS, (file) => uploadImage(file)).then(
@@ -1059,6 +1096,7 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
         });
       } catch (sendError) {
         markOptimisticMessageFailed(textTempId);
+        triggerRealtimeClientEvent(PUSHER_EVENT_CLIENT_MESSAGE_FAILED, { clientIds: [textTempId] });
         firstError = sendError;
       }
     }
@@ -1068,8 +1106,33 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
 
       if (uploadResult.error) {
         markOptimisticMessageFailed(imageTempId);
+        triggerRealtimeClientEvent(PUSHER_EVENT_CLIENT_MESSAGE_FAILED, { clientIds: [imageTempId] });
         firstError ??= uploadResult.error;
       } else {
+        triggerRealtimeClientEvent(PUSHER_EVENT_CLIENT_MESSAGE_PREVIEW, {
+          messages: [
+            {
+              ...optimisticMessages.find((message) => message.id === imageTempId),
+              id: imageTempId,
+              sender,
+              text: null,
+              imageUrl: uploadResult.urls[0] ?? null,
+              imageUrls: uploadResult.urls,
+              createdAt: new Date(createdAt + (textTempId ? 1 : 0)).toISOString(),
+              updatedAt: new Date(createdAt + (textTempId ? 1 : 0)).toISOString(),
+              editedAt: null,
+              recalledAt: null,
+              readAt: null,
+              pinnedAt: null,
+              pinnedBy: null,
+              replyToMessageId: textTempId ? null : replyTarget?.id ?? null,
+              replyTo: textTempId ? null : replyTarget ? toReplyMessage(replyTarget) : null,
+              reactions: [],
+              clientStatus: "sending"
+            }
+          ]
+        });
+
         try {
           await persistOptimisticMessage(
             imageTempId,
@@ -1084,6 +1147,7 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
           );
         } catch (sendError) {
           markOptimisticMessageFailed(imageTempId);
+          triggerRealtimeClientEvent(PUSHER_EVENT_CLIENT_MESSAGE_FAILED, { clientIds: [imageTempId] });
           firstError ??= sendError;
         }
       }

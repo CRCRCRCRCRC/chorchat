@@ -24,6 +24,11 @@ function getPusherServer() {
   return pusherServer;
 }
 
+export function authorizePusherChannel(socketId: string, channelName: string) {
+  const pusher = getPusherServer();
+  return pusher?.authorizeChannel(socketId, channelName) ?? null;
+}
+
 export async function notifyMessagesChanged(payload: {
   type: "created" | "edited" | "recalled" | "read" | "reacted" | "pinned" | "failed";
   id?: string;
