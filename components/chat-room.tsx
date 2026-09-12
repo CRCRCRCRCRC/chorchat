@@ -7,11 +7,12 @@ import { ChatToolsDialog, type ChatToolMode } from "@/components/chat-tools-dial
 import { ImageLightbox } from "@/components/image-lightbox";
 import { MessageBubble } from "@/components/message-bubble";
 import { VoiceCall } from "@/components/voice-call";
-import { playMessageNotificationSound, unlockAudio } from "@/lib/audio-client";
+import { unlockAudio } from "@/lib/audio-client";
 import { clearBrowserUnreadBadge, updateBrowserUnreadBadge } from "@/lib/browser-badge";
 import { formatPresence, usePresence } from "@/lib/presence-client";
 import { acquireRealtimeChannel, isRealtimeSubscribed, triggerRealtimeClientEvent } from "@/lib/pusher-client";
 import { mergeLoadedMessages, mergeRealtimeMessages, messageIdentity } from "@/lib/message-sync";
+import { useMessageNotificationSound } from "@/lib/message-notification-client";
 import type { ReactionEmoji } from "@/lib/reactions";
 import {
   PUSHER_EVENT_CLIENT_MESSAGE_FAILED,
@@ -202,6 +203,7 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
   const loadMessagesPromiseRef = useRef<Promise<void> | null>(null);
   const optimisticImageUrlsRef = useRef<Map<string, string>>(new Map());
   const realtimeConnectedRef = useRef(false);
+  const locallySentIdsRef = useRef(new Set<string>());
   const failedPreviewIdsRef = useRef(new Set<string>());
   const typingStopTimerRef = useRef<number | null>(null);
   const otherTypingTimerRef = useRef<number | null>(null);
@@ -212,6 +214,7 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
 
   const otherSender = OTHER_SENDER[sender];
   const otherPresence = usePresence(sender, otherSender);
+  const notifyMessage = useMessageNotificationSound();
   const pinnedMessageCount = useMemo(
     () => messages.filter((message) => message.pinnedAt && !message.recalledAt && !message.clientStatus).length,
     [messages]
@@ -245,6 +248,10 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
       }
 
       const data = (await response.json()) as { messages: Message[] };
+      if (!hasInitializedMessageTrackingRef.current) {
+        data.messages.forEach((message) => knownMessageIdsRef.current.add(messageIdentity(message)));
+        hasInitializedMessageTrackingRef.current = true;
+      }
       setMessages((currentMessages) => mergeLoadedMessages(currentMessages, data.messages));
     })();
 
@@ -426,7 +433,10 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
 
         if (realtimeMessages.length > 0) {
           if (event.type === "created") {
-            const incomingMessages = realtimeMessages.filter((message) => message.sender !== sender || !message.clientStatus);
+            // Multiple devices can use the same identity; only suppress this tab's own preview.
+            const incomingMessages = realtimeMessages.filter((message) =>
+              !locallySentIdsRef.current.has(messageIdentity(message)) || !message.clientStatus
+            );
 
             if (incomingMessages.length > 0) {
               const replacedClientIds = event.clientIds ?? (event.clientId ? [event.clientId] : []);
@@ -462,7 +472,9 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
         }
       };
       const handleClientMessagePreview = (event: ClientMessagePreviewEvent) => {
-        const incomingMessages = event.messages.filter((message) => message.sender !== sender && !failedPreviewIdsRef.current.has(message.id));
+        const incomingMessages = event.messages.filter((message) =>
+          !locallySentIdsRef.current.has(messageIdentity(message)) && !failedPreviewIdsRef.current.has(message.id)
+        );
 
         if (incomingMessages.length > 0) {
           setMessages((currentMessages) => mergeRealtimeMessages(currentMessages, incomingMessages));
@@ -618,8 +630,13 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
     hasInitialScrolledRef.current = true;
     const scrollContainer = chatScrollRef.current;
     const initialLatestMessageId = latestRenderedMessageIdRef.current;
-    const stopInitialSettling = () => mutationObserver.disconnect();
+    let isSettling = true;
+    const stopInitialSettling = () => {
+      isSettling = false;
+      mutationObserver.disconnect();
+    };
     const jumpToBottom = () => {
+      if (!isSettling) return;
       if (latestRenderedMessageIdRef.current !== initialLatestMessageId) {
         stopInitialSettling();
         return;
@@ -683,21 +700,11 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
     return null;
   }, [messages, sender]);
 
-  useEffect(() => {
-    if (isLoading) {
-      return;
-    }
-
+  useLayoutEffect(() => {
     const visibleMessages = messages.filter((message) => message.clientStatus !== "failed");
     const knownMessageIds = knownMessageIdsRef.current;
-
-    if (!hasInitializedMessageTrackingRef.current) {
-      visibleMessages.forEach((message) => knownMessageIds.add(messageIdentity(message)));
-      hasInitializedMessageTrackingRef.current = true;
-      return;
-    }
-
     let newIncomingMessageCount = 0;
+    let newSyncedOwnMessageCount = 0;
 
     visibleMessages.forEach((message) => {
       if (knownMessageIds.has(messageIdentity(message))) {
@@ -708,17 +715,21 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
 
       if (message.sender !== sender && !message.recalledAt) {
         newIncomingMessageCount += 1;
+      } else if (!locallySentIdsRef.current.has(messageIdentity(message)) && !message.recalledAt) {
+        newSyncedOwnMessageCount += 1;
       }
     });
 
     if (newIncomingMessageCount === 0) {
+      if (newSyncedOwnMessageCount > 0) {
+        if (autoScrollOnIncoming) scrollToLatest("instant");
+        else setIsAwayFromBottom(true);
+      }
       return;
     }
 
-    void playMessageNotificationSound();
-
     if (autoScrollOnIncoming) {
-      scrollToLatest("smooth");
+      scrollToLatest("instant");
     } else {
       const scrollContainer = chatScrollRef.current;
       if (isProgrammaticScrollRef.current && scrollContainer) {
@@ -733,11 +744,13 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
     if (!isPageActive) {
       setUnreadCount((currentCount) => currentCount + newIncomingMessageCount);
     }
+
+    notifyMessage();
   }, [
     autoScrollOnIncoming,
-    isLoading,
     isPageActive,
     messages,
+    notifyMessage,
     scrollToLatest,
     sender,
     stopProgrammaticScrollTracking
@@ -1027,6 +1040,7 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
     }
 
     startProgrammaticScrollTracking(1400);
+    optimisticMessages.forEach((message) => locallySentIdsRef.current.add(messageIdentity(message)));
     setMessages((currentMessages) => [...currentMessages, ...optimisticMessages]);
     window.requestAnimationFrame(() => scrollToLatest("smooth"));
     setReplyTo(null);
@@ -1330,7 +1344,7 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
         }}
         className="chat-scrollbar mx-auto flex min-h-0 w-full max-w-5xl flex-1 flex-col gap-4 overflow-y-auto px-3 py-5 sm:px-5"
       >
-        {isLoading ? (
+        {isLoading && messages.length === 0 ? (
           <div className="flex flex-1 items-center justify-center">
             <div className="h-10 w-10 animate-spin rounded-full border-2 border-line border-t-brand" />
           </div>
