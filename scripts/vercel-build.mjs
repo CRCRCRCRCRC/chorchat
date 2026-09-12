@@ -44,6 +44,7 @@ function getMigrationDatabaseUrl() {
 run("node_modules/prisma/build/index.js", ["generate"]);
 run("node_modules/prisma/build/index.js", ["migrate", "deploy"], {
   ...process.env,
-  DATABASE_URL: getMigrationDatabaseUrl()
+  DATABASE_URL: getMigrationDatabaseUrl(),
+  PRISMA_SCHEMA_DISABLE_ADVISORY_LOCK: "1"
 });
 run("node_modules/next/dist/bin/next", ["build"]);

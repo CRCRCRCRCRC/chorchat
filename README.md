@@ -93,7 +93,7 @@ npm run dev
 npm run vercel-build
 ```
 
-此指令會在每次部署時先使用 Neon direct connection 執行 production migration，再建立 Next.js 正式版本。它會優先使用 `DIRECT_URL` 或 `DATABASE_URL_UNPOOLED`；若兩者都沒有，會自動從 Neon pooled hostname 移除 `-pooler`，不需要額外設定。若要手動執行 migration：
+此指令會在每次部署時先使用 Neon direct connection 執行 production migration，再建立 Next.js 正式版本。它會優先使用 `DIRECT_URL` 或 `DATABASE_URL_UNPOOLED`；若兩者都沒有，會自動從 Neon pooled hostname 移除 `-pooler`，不需要額外設定。部署腳本會停用 Prisma advisory lock，避免 Neon 中殘留的 migration lock 阻擋 Vercel 建置。若要手動執行 migration：
 
 ```bash
 npm run db:deploy
