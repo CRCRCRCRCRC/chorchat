@@ -10,7 +10,8 @@ import { VoiceCall } from "@/components/voice-call";
 import { playMessageNotificationSound, unlockAudio } from "@/lib/audio-client";
 import { clearBrowserUnreadBadge, updateBrowserUnreadBadge } from "@/lib/browser-badge";
 import { formatPresence, usePresence } from "@/lib/presence-client";
-import { acquireRealtimeChannel, triggerRealtimeClientEvent } from "@/lib/pusher-client";
+import { acquireRealtimeChannel, isRealtimeSubscribed, triggerRealtimeClientEvent } from "@/lib/pusher-client";
+import { mergeLoadedMessages, mergeRealtimeMessages, messageIdentity } from "@/lib/message-sync";
 import type { ReactionEmoji } from "@/lib/reactions";
 import {
   PUSHER_EVENT_CLIENT_MESSAGE_FAILED,
@@ -51,70 +52,6 @@ const TYPING_EXPIRE_MS = 3200;
 const CHAT_BOTTOM_THRESHOLD_PX = 48;
 const CHAT_JUMP_BUTTON_THRESHOLD_PX = 180;
 const AUTO_SCROLL_STORAGE_PREFIX = "chorchat:auto-scroll";
-
-function sortMessagesByCreatedAt(messages: Message[]) {
-  return [...messages].sort((first, second) => new Date(first.createdAt).getTime() - new Date(second.createdAt).getTime());
-}
-
-function areMessagesEquivalent(first: Message[], second: Message[]) {
-  return (
-    first.length === second.length &&
-    first.every((message, index) => {
-      const nextMessage = second[index];
-
-      return (
-        message.id === nextMessage?.id &&
-        message.updatedAt === nextMessage.updatedAt &&
-        message.readAt === nextMessage.readAt &&
-        message.pinnedAt === nextMessage.pinnedAt &&
-        message.pinnedBy === nextMessage.pinnedBy &&
-        message.reactions.length === nextMessage.reactions.length &&
-        message.reactions.every(
-          (reaction, reactionIndex) =>
-            reaction.id === nextMessage.reactions[reactionIndex]?.id &&
-            reaction.sender === nextMessage.reactions[reactionIndex]?.sender &&
-            reaction.emoji === nextMessage.reactions[reactionIndex]?.emoji
-        ) &&
-        message.clientStatus === nextMessage.clientStatus
-      );
-    })
-  );
-}
-
-function mergeLoadedMessages(currentMessages: Message[], loadedMessages: Message[]) {
-  const loadedIds = new Set(loadedMessages.map((message) => message.id));
-  const pendingMessages = currentMessages.filter(
-    (message) => message.clientStatus && message.id.startsWith("optimistic-") && !loadedIds.has(message.id)
-  );
-
-  const mergedMessages = sortMessagesByCreatedAt([...loadedMessages, ...pendingMessages]);
-  return areMessagesEquivalent(currentMessages, mergedMessages) ? currentMessages : mergedMessages;
-}
-
-function normalizeRealtimeMessage(message: Message): Message {
-  return {
-    ...message,
-    imageUrls: message.imageUrls ?? (message.imageUrl ? [message.imageUrl] : []),
-    reactions: message.reactions ?? []
-  };
-}
-
-function mergeRealtimeMessages(currentMessages: Message[], realtimeMessages: Message[], replacedClientIds: string[] = []) {
-  const normalizedMessages = realtimeMessages.map(normalizeRealtimeMessage);
-  const realtimeById = new Map(normalizedMessages.map((message) => [message.id, message]));
-  const replacedClientIdSet = new Set(replacedClientIds);
-  const retainedMessages = currentMessages.filter((message) => !replacedClientIdSet.has(message.id));
-  const currentIds = new Set(retainedMessages.map((message) => message.id));
-  const updatedMessages = retainedMessages.map((message) => realtimeById.get(message.id) ?? message);
-
-  normalizedMessages.forEach((message) => {
-    if (!currentIds.has(message.id)) {
-      updatedMessages.push(message);
-    }
-  });
-
-  return sortMessagesByCreatedAt(updatedMessages);
-}
 
 function getOptimisticId() {
   if (globalThis.crypto?.randomUUID) {
@@ -252,6 +189,9 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
   const [isAwayFromBottom, setIsAwayFromBottom] = useState(false);
   const [activeTool, setActiveTool] = useState<ChatToolMode | null>(null);
   const [autoScrollOnIncoming, setAutoScrollOnIncoming] = useState(false);
+  const [realtimeStatus, setRealtimeStatus] = useState<"connecting" | "ready" | "fallback">("connecting");
+  const [realtimeAttempt, setRealtimeAttempt] = useState(0);
+  const [relayError, setRelayError] = useState(false);
   const chatScrollRef = useRef<HTMLElement | null>(null);
   const hasInitialScrolledRef = useRef(false);
   const latestRenderedMessageIdRef = useRef<string | null>(null);
@@ -262,6 +202,7 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
   const loadMessagesPromiseRef = useRef<Promise<void> | null>(null);
   const optimisticImageUrlsRef = useRef<Map<string, string>>(new Map());
   const realtimeConnectedRef = useRef(false);
+  const failedPreviewIdsRef = useRef(new Set<string>());
   const typingStopTimerRef = useRef<number | null>(null);
   const otherTypingTimerRef = useRef<number | null>(null);
   const readSyncRef = useRef(false);
@@ -295,7 +236,8 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
 
     const request = (async () => {
       const response = await fetch("/api/messages", {
-        cache: "no-store"
+        cache: "no-store",
+        signal: AbortSignal.timeout(8000)
       });
 
       if (!response.ok) {
@@ -376,6 +318,8 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
   useEffect(() => {
     let timeoutId: number | null = null;
     let isStopped = false;
+    let cleanupChannel: (() => void) | undefined;
+    let retryTimer: number | undefined;
 
     function getPollingDelay() {
       if (document.hidden) {
@@ -388,6 +332,7 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
     }
 
     function schedulePoll(delay = getPollingDelay()) {
+      if (isStopped) return;
       if (timeoutId) {
         window.clearTimeout(timeoutId);
       }
@@ -409,149 +354,160 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
 
     document.addEventListener("visibilitychange", handleVisibilityChange);
 
-    const realtimeLease = acquireRealtimeChannel();
+    schedulePoll();
+    setRealtimeStatus("connecting");
+    void acquireRealtimeChannel().then((realtimeLease) => {
+      if (isStopped) {
+        realtimeLease?.release();
+        return;
+      }
 
-    if (!realtimeLease) {
-      realtimeConnectedRef.current = false;
-      schedulePoll();
+      if (!realtimeLease) {
+        realtimeConnectedRef.current = false;
+        setRealtimeStatus("fallback");
+        schedulePoll();
+        retryTimer = window.setTimeout(() => setRealtimeAttempt((attempt) => attempt + 1), 5000);
+        return;
+      }
 
-      return () => {
-        isStopped = true;
-        document.removeEventListener("visibilitychange", handleVisibilityChange);
+      const { pusher, channel } = realtimeLease;
+      const handleStateChange = () => {
+        const isConnected = isRealtimeSubscribed(realtimeLease);
+        const wasConnected = realtimeConnectedRef.current;
+        realtimeConnectedRef.current = isConnected;
+        setRealtimeStatus(isConnected ? "ready" : "connecting");
+        if (isConnected) window.clearTimeout(retryTimer);
 
-        if (timeoutId) {
-          window.clearTimeout(timeoutId);
+        if (wasConnected !== isConnected) {
+          schedulePoll(0);
         }
       };
-    }
-
-    const { pusher, channel } = realtimeLease;
-    realtimeConnectedRef.current = pusher.connection.state === "connected";
-    const handleStateChange = ({ current }: { current: string }) => {
-      const isConnected = current === "connected";
-      const wasConnected = realtimeConnectedRef.current;
-      realtimeConnectedRef.current = isConnected;
-
-      if (wasConnected !== isConnected) {
-        schedulePoll(isConnected ? MESSAGE_REALTIME_HEALTH_CHECK_MS : 0);
-      }
-    };
-    const handleMessagesChanged = (event: MessagesChangedEvent) => {
-      if (event.type === "failed") {
-        const failedClientIds = new Set(event.clientIds ?? (event.clientId ? [event.clientId] : []));
-
-        if (failedClientIds.size > 0) {
-          setMessages((currentMessages) =>
-            currentMessages.filter((message) => !failedClientIds.has(message.id))
-          );
+      const handleSubscriptionError = () => {
+        realtimeConnectedRef.current = false;
+        setRealtimeStatus("fallback");
+        schedulePoll(0);
+        window.clearTimeout(retryTimer);
+        retryTimer = window.setTimeout(() => {
+          if (pusher.connection.state !== "connected") return;
+          channel.unsubscribe();
+          channel.subscribe();
+        }, 5000);
+      };
+      const handleFailedIds = (ids: string[]) => {
+        const failedClientIds = new Set(ids);
+        ids.forEach((id) => failedPreviewIdsRef.current.add(id));
+        while (failedPreviewIdsRef.current.size > 500) {
+          failedPreviewIdsRef.current.delete(failedPreviewIdsRef.current.values().next().value!);
         }
-
-        return;
-      }
-
-      if (event.type === "read" && event.reader && event.readAt) {
-        setMessages((currentMessages) =>
-          currentMessages.map((message) =>
-            message.sender !== event.reader && !message.clientStatus
-              ? { ...message, readAt: message.readAt ?? event.readAt ?? null }
-              : message
-          )
-        );
-        return;
-      }
-
-      const realtimeMessages = event.messages ?? (event.message ? [event.message] : []);
-
-      if (realtimeMessages.length > 0) {
-        if (event.type === "created") {
-          const incomingMessages = realtimeMessages.filter((message) => message.sender !== sender);
-
-          if (incomingMessages.length > 0) {
-            const replacedClientIds = event.clientIds ?? (event.clientId ? [event.clientId] : []);
-
-            if (replacedClientIds.length > 0) {
-              incomingMessages.forEach((message, index) => {
-                const replacedClientId = replacedClientIds[index];
-
-                if (replacedClientId && knownMessageIdsRef.current.has(replacedClientId)) {
-                  knownMessageIdsRef.current.add(message.id);
-                }
-              });
-            }
-
-            setMessages((currentMessages) =>
-              mergeRealtimeMessages(currentMessages, incomingMessages, replacedClientIds)
-            );
-          }
-
+        setMessages((current) => current.flatMap((message) => {
+          if (!failedClientIds.has(message.id)) return [message];
+          return message.sender === sender ? [{ ...message, clientStatus: "failed" as const }] : [];
+        }));
+      };
+      const handleMessagesChanged = (event: MessagesChangedEvent) => {
+        if (event.type === "failed") {
+          handleFailedIds(event.clientIds ?? (event.clientId ? [event.clientId] : []));
           return;
         }
 
-        setMessages((currentMessages) => mergeRealtimeMessages(currentMessages, realtimeMessages));
-        return;
+        if (event.type === "read" && event.reader && event.readAt) {
+          setMessages((currentMessages) =>
+            currentMessages.map((message) =>
+              message.sender !== event.reader && !message.clientStatus
+                ? { ...message, readAt: message.readAt ?? event.readAt ?? null }
+                : message
+            )
+          );
+          return;
+        }
+
+        const realtimeMessages = (event.messages ?? (event.message ? [event.message] : []))
+          .filter((message) => !message.clientStatus || !failedPreviewIdsRef.current.has(message.id));
+
+        if (realtimeMessages.length > 0) {
+          if (event.type === "created") {
+            const incomingMessages = realtimeMessages.filter((message) => message.sender !== sender || !message.clientStatus);
+
+            if (incomingMessages.length > 0) {
+              const replacedClientIds = event.clientIds ?? (event.clientId ? [event.clientId] : []);
+
+              setMessages((currentMessages) =>
+                mergeRealtimeMessages(currentMessages, incomingMessages, replacedClientIds)
+              );
+            }
+
+            return;
+          }
+
+          setMessages((currentMessages) => mergeRealtimeMessages(currentMessages, realtimeMessages));
+          return;
+        }
+
+        void loadMessages().catch(() => undefined);
+      };
+      const handleTypingChanged = (event: { sender: Sender; isTyping: boolean }) => {
+        if (event.sender === sender) {
+          return;
+        }
+
+        if (otherTypingTimerRef.current) {
+          window.clearTimeout(otherTypingTimerRef.current);
+          otherTypingTimerRef.current = null;
+        }
+
+        setIsOtherTyping(event.isTyping);
+
+        if (event.isTyping) {
+          otherTypingTimerRef.current = window.setTimeout(() => setIsOtherTyping(false), TYPING_EXPIRE_MS);
+        }
+      };
+      const handleClientMessagePreview = (event: ClientMessagePreviewEvent) => {
+        const incomingMessages = event.messages.filter((message) => message.sender !== sender && !failedPreviewIdsRef.current.has(message.id));
+
+        if (incomingMessages.length > 0) {
+          setMessages((currentMessages) => mergeRealtimeMessages(currentMessages, incomingMessages));
+        }
+      };
+      const handleClientMessageFailed = (event: ClientMessageFailedEvent) => {
+        handleFailedIds(event.clientIds);
+      };
+
+      pusher.connection.bind("state_change", handleStateChange);
+      channel.bind("pusher:subscription_succeeded", handleStateChange);
+      channel.bind("pusher:subscription_error", handleSubscriptionError);
+      channel.bind(PUSHER_EVENT_MESSAGES_CHANGED, handleMessagesChanged);
+      channel.bind(PUSHER_EVENT_TYPING_CHANGED, handleTypingChanged);
+      channel.bind(PUSHER_EVENT_CLIENT_MESSAGE_PREVIEW, handleClientMessagePreview);
+      channel.bind(PUSHER_EVENT_CLIENT_MESSAGE_FAILED, handleClientMessageFailed);
+      handleStateChange();
+      if (pusher.connection.state === "connected" && !channel.subscribed && !channel.subscriptionPending) {
+        channel.subscribe();
       }
 
-      void loadMessages().catch(() => undefined);
-    };
-    const handleTypingChanged = (event: { sender: Sender; isTyping: boolean }) => {
-      if (event.sender === sender) {
-        return;
-      }
-
-      if (otherTypingTimerRef.current) {
-        window.clearTimeout(otherTypingTimerRef.current);
-        otherTypingTimerRef.current = null;
-      }
-
-      setIsOtherTyping(event.isTyping);
-
-      if (event.isTyping) {
-        otherTypingTimerRef.current = window.setTimeout(() => setIsOtherTyping(false), TYPING_EXPIRE_MS);
-      }
-    };
-    const handleClientMessagePreview = (event: ClientMessagePreviewEvent) => {
-      const incomingMessages = event.messages.filter((message) => message.sender !== sender);
-
-      if (incomingMessages.length > 0) {
-        setMessages((currentMessages) => mergeRealtimeMessages(currentMessages, incomingMessages));
-      }
-    };
-    const handleClientMessageFailed = (event: ClientMessageFailedEvent) => {
-      const failedClientIds = new Set(event.clientIds);
-
-      if (failedClientIds.size > 0) {
-        setMessages((currentMessages) =>
-          currentMessages.filter((message) => !failedClientIds.has(message.id))
-        );
-      }
-    };
-
-    pusher.connection.bind("state_change", handleStateChange);
-    channel.bind(PUSHER_EVENT_MESSAGES_CHANGED, handleMessagesChanged);
-    channel.bind(PUSHER_EVENT_TYPING_CHANGED, handleTypingChanged);
-    channel.bind(PUSHER_EVENT_CLIENT_MESSAGE_PREVIEW, handleClientMessagePreview);
-    channel.bind(PUSHER_EVENT_CLIENT_MESSAGE_FAILED, handleClientMessageFailed);
-    schedulePoll();
+      cleanupChannel = () => {
+        realtimeConnectedRef.current = false;
+        if (otherTypingTimerRef.current) {
+          window.clearTimeout(otherTypingTimerRef.current);
+        }
+        pusher.connection.unbind("state_change", handleStateChange);
+        channel.unbind("pusher:subscription_succeeded", handleStateChange);
+        channel.unbind("pusher:subscription_error", handleSubscriptionError);
+        channel.unbind(PUSHER_EVENT_MESSAGES_CHANGED, handleMessagesChanged);
+        channel.unbind(PUSHER_EVENT_TYPING_CHANGED, handleTypingChanged);
+        channel.unbind(PUSHER_EVENT_CLIENT_MESSAGE_PREVIEW, handleClientMessagePreview);
+        channel.unbind(PUSHER_EVENT_CLIENT_MESSAGE_FAILED, handleClientMessageFailed);
+        realtimeLease.release();
+      };
+    });
 
     return () => {
       isStopped = true;
-      realtimeConnectedRef.current = false;
       document.removeEventListener("visibilitychange", handleVisibilityChange);
-
-      if (timeoutId) {
-        window.clearTimeout(timeoutId);
-      }
-      if (otherTypingTimerRef.current) {
-        window.clearTimeout(otherTypingTimerRef.current);
-      }
-      pusher.connection.unbind("state_change", handleStateChange);
-      channel.unbind(PUSHER_EVENT_MESSAGES_CHANGED, handleMessagesChanged);
-      channel.unbind(PUSHER_EVENT_TYPING_CHANGED, handleTypingChanged);
-      channel.unbind(PUSHER_EVENT_CLIENT_MESSAGE_PREVIEW, handleClientMessagePreview);
-      channel.unbind(PUSHER_EVENT_CLIENT_MESSAGE_FAILED, handleClientMessageFailed);
-      realtimeLease.release();
+      if (timeoutId) window.clearTimeout(timeoutId);
+      window.clearTimeout(retryTimer);
+      cleanupChannel?.();
     };
-  }, [loadMessages, sender]);
+  }, [loadMessages, sender, realtimeAttempt]);
 
   useEffect(() => {
     const optimisticImageUrls = optimisticImageUrlsRef.current;
@@ -732,23 +688,23 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
       return;
     }
 
-    const persistedMessages = messages.filter((message) => !message.clientStatus);
+    const visibleMessages = messages.filter((message) => message.clientStatus !== "failed");
     const knownMessageIds = knownMessageIdsRef.current;
 
     if (!hasInitializedMessageTrackingRef.current) {
-      persistedMessages.forEach((message) => knownMessageIds.add(message.id));
+      visibleMessages.forEach((message) => knownMessageIds.add(messageIdentity(message)));
       hasInitializedMessageTrackingRef.current = true;
       return;
     }
 
     let newIncomingMessageCount = 0;
 
-    persistedMessages.forEach((message) => {
-      if (knownMessageIds.has(message.id)) {
+    visibleMessages.forEach((message) => {
+      if (knownMessageIds.has(messageIdentity(message))) {
         return;
       }
 
-      knownMessageIds.add(message.id);
+      knownMessageIds.add(messageIdentity(message));
 
       if (message.sender !== sender && !message.recalledAt) {
         newIncomingMessageCount += 1;
@@ -867,6 +823,14 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
     requestBody: CreateMessageRequest,
     localImageCount = 0
   ) {
+    // Publish independently: neither DB startup nor an unrelated Pusher setting may gate delivery.
+    void fetch("/api/realtime", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(requestBody),
+      signal: AbortSignal.timeout(5000)
+    }).then((response) => setRelayError(!response.ok)).catch(() => setRelayError(true));
+
     const response = await fetch("/api/messages", {
       method: "POST",
       headers: {
@@ -891,10 +855,7 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
     }
 
     setMessages((currentMessages) =>
-      sortMessagesByCreatedAt([
-        ...currentMessages.filter((message) => message.id !== tempId && message.id !== data.message.id),
-        data.message
-      ])
+      mergeRealtimeMessages(currentMessages, [data.message], [tempId])
     );
   }
 
@@ -1271,6 +1232,12 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
 
   return (
     <main className="flex h-dvh flex-col bg-paper text-ink">
+      {realtimeStatus !== "ready" || relayError ? (
+        <div role="status" className="flex shrink-0 items-center justify-center gap-3 bg-amber-50 px-3 py-1 text-xs text-amber-900">
+          <span>{relayError ? "即時傳送暫時失敗，訊息仍會儲存並同步" : realtimeStatus === "connecting" ? "正在連接聊天室…" : "即時連線中斷，正在重新連線"}</span>
+          <button type="button" className="shrink-0 underline" onClick={() => { setRelayError(false); setRealtimeAttempt((attempt) => attempt + 1); }}>重新連線</button>
+        </div>
+      ) : null}
       <header className="border-b border-line bg-white/95 backdrop-blur">
         <div className="mx-auto flex max-w-5xl items-center justify-between gap-3 px-4 py-3">
           <button

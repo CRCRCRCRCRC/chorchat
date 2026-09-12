@@ -83,7 +83,7 @@ npm run dev
 1. 將專案推到 GitHub。
 2. 建立 Neon PostgreSQL database，取得 `DATABASE_URL`。
 3. 在 Vercel 建立 Blob store，取得 `BLOB_READ_WRITE_TOKEN`。
-4. 建立 Pusher Channels app，取得 app id、key、secret、cluster，並在 App Settings 開啟 `Enable client events`。
+4. 建立 Pusher Channels app，取得 app id、key、secret、cluster。App Settings 的 `Enable client events` 可開啟以加速瀏覽器直接傳送；沒有開啟時也會透過伺服器即時轉送。
 5. 在 Vercel 匯入 GitHub repo。
 6. 到 Vercel Project Settings 加入 `.env.example` 中的環境變數。
 7. 務必設定 `CHORCHAT_AUTH_PASSWORD`，避免公開網址被其他人直接進聊天室或呼叫 API。
@@ -100,6 +100,32 @@ npm run db:deploy
 ```
 
 不要在 production 使用 `npm run db:push`，production database 應使用 migration。
+
+## 即時傳送與延遲排查
+
+- 送出訊息時，同時呼叫 `/api/realtime` 即時轉送與 `/api/messages` 儲存；即使 Neon 正在啟動，接收端也不需要等資料庫完成才顯示訊息和未讀提醒。預覽尚未儲存時不開放編輯、回覆等操作。
+- `/api/realtime` 的 GET 僅提供公開 key 和 cluster。前後端共用伺服器的 cluster 設定，避免兩個 cluster 環境變數不一致而訂閱錯誤的節點；secret 不會傳給瀏覽器。
+- 必須成功訂閱聊天室才算即時連線就緒。授權失敗會顯示重連提示，並以 1.5 秒間隔補抓訊息，不會誤用正常連線的 15 秒檢查間隔。這些間隔不含 API 回應時間。
+- 同一則訊息的預覽、儲存結果和補抓資料會去重。長中文或多張圖片超過 Pusher 單事件 10KB 限制時，伺服器會分段傳送並由瀏覽器組回。
+- `vercel.json` 將 Functions 區域設為新加坡 `sin1`，對應目前 Neon 的新加坡區域。若日後移動資料庫，請一起調整 Functions 區域。[Vercel 區域文件](https://vercel.com/docs/functions/configuring-functions/region)。Build log 的建置機器位置與 Functions 執行位置是兩回事。
+- Chrome/Edge 開發者工具的 Network 中，`/api/realtime` 的 `Server-Timing: publish` 是伺服器向 Pusher 發布的時間，`/api/messages` 的 `Server-Timing: persist` 是儲存處理時間；兩者都不是另一支手機實際收到的時間。Pusher 的 Client Events 設定與訂閱事件請見 [Pusher 官方文件](https://pusher.com/docs/channels/using_channels/events/)。
+
+## 回歸測試
+
+```bash
+npm test
+npx playwright install chromium
+npm run test:e2e
+```
+
+瀏覽器測試使用兩個獨立身分、桌機和手機視窗，模擬 Pusher 與資料庫，包含關閉 Client Events、儲存延遲 10 秒、訂閱失敗重連、即時未讀提醒和重複事件。測試不會存取正式聊天資料，也不代表正式環境的網路延遲。正式環境仍需兩支手機實測。
+
+Windows 已安裝 Edge 時，可省略 Chromium 下載，改用：
+
+```powershell
+$env:PLAYWRIGHT_CHANNEL = "msedge"
+npm run test:e2e
+```
 
 ## 資料表
 

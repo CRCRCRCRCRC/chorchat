@@ -5,7 +5,7 @@ import { Mic, MicOff, Phone, PhoneCall, PhoneOff, X } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { playToneSequence, unlockAudio } from "@/lib/audio-client";
 import type { CallSignal, CallSignalType } from "@/lib/call";
-import { acquireRealtimeChannel } from "@/lib/pusher-client";
+import { acquireRealtimeChannel, isRealtimeSubscribed } from "@/lib/pusher-client";
 import { PUSHER_EVENT_CALL_SIGNAL } from "@/lib/realtime";
 import { SENDER_LABEL, type Sender } from "@/lib/types";
 
@@ -55,6 +55,7 @@ export function VoiceCall({ sender, recipient }: VoiceCallProps) {
   const [isPanelOpen, setIsPanelOpen] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const [realtimeAttempt, setRealtimeAttempt] = useState(0);
   const statusRef = useRef(status);
   const callIdRef = useRef<string | null>(null);
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
@@ -588,31 +589,50 @@ export function VoiceCall({ sender, recipient }: VoiceCallProps) {
   );
 
   useEffect(() => {
-    const realtimeLease = acquireRealtimeChannel();
+    let stopped = false;
+    let cleanup: (() => void) | undefined;
+    let retryTimer: number | undefined;
+    void acquireRealtimeChannel().then((realtimeLease) => {
+      if (stopped) {
+        realtimeLease?.release();
+        return;
+      }
 
-    if (!realtimeLease) {
-      return;
-    }
+      if (!realtimeLease) {
+        retryTimer = window.setTimeout(() => setRealtimeAttempt((attempt) => attempt + 1), 5000);
+        return;
+      }
 
-    const { pusher, channel } = realtimeLease;
-    pusherConnectedRef.current = pusher.connection.state === "connected";
-    const handleStateChange = ({ current }: { current: string }) => {
-      pusherConnectedRef.current = current === "connected";
-    };
-    const handleCallSignal = (signal: CallSignal) => {
-      void receiveSignal(signal);
-    };
+      const { pusher, channel } = realtimeLease;
+      const handleStateChange = () => {
+        pusherConnectedRef.current = isRealtimeSubscribed(realtimeLease);
+      };
+      const handleSubscriptionError = () => { pusherConnectedRef.current = false; };
+      const handleCallSignal = (signal: CallSignal) => {
+        void receiveSignal(signal);
+      };
 
-    pusher.connection.bind("state_change", handleStateChange);
-    channel.bind(PUSHER_EVENT_CALL_SIGNAL, handleCallSignal);
+      pusher.connection.bind("state_change", handleStateChange);
+      channel.bind("pusher:subscription_succeeded", handleStateChange);
+      channel.bind("pusher:subscription_error", handleSubscriptionError);
+      channel.bind(PUSHER_EVENT_CALL_SIGNAL, handleCallSignal);
+      handleStateChange();
 
+      cleanup = () => {
+        pusherConnectedRef.current = false;
+        pusher.connection.unbind("state_change", handleStateChange);
+        channel.unbind("pusher:subscription_succeeded", handleStateChange);
+        channel.unbind("pusher:subscription_error", handleSubscriptionError);
+        channel.unbind(PUSHER_EVENT_CALL_SIGNAL, handleCallSignal);
+        realtimeLease.release();
+      };
+    });
     return () => {
-      pusherConnectedRef.current = false;
-      pusher.connection.unbind("state_change", handleStateChange);
-      channel.unbind(PUSHER_EVENT_CALL_SIGNAL, handleCallSignal);
-      realtimeLease.release();
+      stopped = true;
+      window.clearTimeout(retryTimer);
+      cleanup?.();
     };
-  }, [receiveSignal]);
+  }, [receiveSignal, realtimeAttempt]);
 
   useEffect(() => {
     let isStopped = false;

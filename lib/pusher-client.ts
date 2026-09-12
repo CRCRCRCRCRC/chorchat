@@ -2,33 +2,42 @@
 
 import Pusher from "pusher-js";
 import { PUSHER_CHANNEL } from "@/lib/realtime";
+import { createRealtimeAssembler, REALTIME_CHUNK_EVENT } from "@/lib/realtime-payload";
 
 let sharedPusher: Pusher | null = null;
 let sharedChannel: ReturnType<Pusher["subscribe"]> | null = null;
 let consumerCount = 0;
 let disconnectTimer: number | null = null;
+let connecting: Promise<void> | null = null;
 
-export function acquireRealtimeChannel() {
-  const key = process.env.NEXT_PUBLIC_PUSHER_KEY;
-  const cluster = process.env.NEXT_PUBLIC_PUSHER_CLUSTER;
+async function connect() {
+  const response = await fetch("/api/realtime", { cache: "no-store", signal: AbortSignal.timeout(5000) });
+  if (!response.ok) throw new Error("Realtime configuration unavailable.");
+  const { config } = await response.json() as { config: { key: string; cluster: string } | null };
+  if (!config) return;
 
-  if (!key || !cluster) {
-    return null;
-  }
+  sharedPusher = new Pusher(config.key, {
+    cluster: config.cluster,
+    forceTLS: true,
+    channelAuthorization: { endpoint: "/api/pusher/auth", transport: "ajax" }
+  });
+  sharedChannel = sharedPusher.subscribe(PUSHER_CHANNEL);
+  const channel = sharedChannel;
+  channel.bind(REALTIME_CHUNK_EVENT, createRealtimeAssembler((event, data) => channel.emit(event, data)));
+}
+
+export async function acquireRealtimeChannel() {
 
   if (disconnectTimer) {
     window.clearTimeout(disconnectTimer);
     disconnectTimer = null;
   }
 
-  sharedPusher ??= new Pusher(key, {
-    cluster,
-    channelAuthorization: {
-      endpoint: "/api/pusher/auth",
-      transport: "ajax"
-    }
-  });
-  sharedChannel ??= sharedPusher.subscribe(PUSHER_CHANNEL);
+  if (!sharedPusher) {
+    connecting ??= connect().catch(() => undefined).finally(() => { connecting = null; });
+    await connecting;
+  }
+  if (!sharedPusher || !sharedChannel) return null;
   consumerCount += 1;
   let isReleased = false;
 
@@ -62,7 +71,8 @@ export function acquireRealtimeChannel() {
 }
 
 export function triggerRealtimeClientEvent(eventName: string, payload: Record<string, unknown>) {
-  if (!sharedChannel?.subscribed) {
+  if (!sharedChannel?.subscribed || sharedPusher?.connection.state !== "connected" ||
+    new TextEncoder().encode(JSON.stringify(payload)).length > 9000) {
     return false;
   }
 
@@ -72,4 +82,8 @@ export function triggerRealtimeClientEvent(eventName: string, payload: Record<st
     console.error("Realtime client event failed", error);
     return false;
   }
+}
+
+export function isRealtimeSubscribed(lease: NonNullable<Awaited<ReturnType<typeof acquireRealtimeChannel>>>) {
+  return lease.pusher.connection.state === "connected" && lease.channel.subscribed;
 }

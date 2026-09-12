@@ -1,23 +1,12 @@
 import { after, NextResponse } from "next/server";
 import { z } from "zod";
+import { storedMessageId } from "@/lib/message-identity";
+import { getImageUrls, messageInputSchema, type MessageInput } from "@/lib/message-input";
 import { messageInclude } from "@/lib/message-query";
 import { prisma } from "@/lib/prisma";
 import { notifyMessagesChanged } from "@/lib/pusher-server";
 
 export const runtime = "nodejs";
-
-const messageInputSchema = z
-  .object({
-    sender: z.enum(["CHEN", "ZUO"]),
-    clientId: z.string().max(100).regex(/^optimistic-[a-zA-Z0-9-]+$/).optional(),
-    text: z.string().trim().max(4000).optional(),
-    imageUrl: z.string().url().optional(),
-    imageUrls: z.array(z.string().url()).max(30).optional(),
-    replyToMessageId: z.string().cuid().optional()
-  })
-  .refine((data) => Boolean(data.text?.trim() || data.imageUrl || data.imageUrls?.length), {
-    message: "Message needs text or image."
-  });
 
 const createMessageSchema = z.union([
   messageInputSchema,
@@ -26,22 +15,17 @@ const createMessageSchema = z.union([
   })
 ]);
 
-type MessageInput = z.infer<typeof messageInputSchema>;
-
 function getMessageInputs(data: z.infer<typeof createMessageSchema>) {
   return "messages" in data ? data.messages : [data];
 }
 
-function getImageUrls(message: MessageInput) {
-  const urls = message.imageUrls?.length ? message.imageUrls : message.imageUrl ? [message.imageUrl] : [];
-  return urls.slice(0, 30);
-}
-
-function createStoredMessage(message: MessageInput) {
+function createStoredMessage(message: MessageInput, createdAt: Date) {
   const imageUrls = getImageUrls(message);
 
   return prisma.message.create({
     data: {
+      id: message.clientId ? storedMessageId(message.clientId, message.sender) : undefined,
+      createdAt,
       imageUrls,
       sender: message.sender,
       text: message.text?.trim() || null,
@@ -52,39 +36,9 @@ function createStoredMessage(message: MessageInput) {
   });
 }
 
-function createProvisionalMessage(message: MessageInput) {
-  if (!message.clientId) {
-    return null;
-  }
-
-  const imageUrls = getImageUrls(message);
-  const createdAt = new Date().toISOString();
-
-  return {
-    id: message.clientId,
-    sender: message.sender,
-    text: message.text?.trim() || null,
-    imageUrl: imageUrls[0] ?? null,
-    imageUrls,
-    createdAt,
-    updatedAt: createdAt,
-    editedAt: null,
-    recalledAt: null,
-    readAt: null,
-    pinnedAt: null,
-    pinnedBy: null,
-    replyToMessageId: message.replyToMessageId ?? null,
-    replyTo: null,
-    reactions: [],
-    clientStatus: "sending"
-  };
-}
-
 export async function GET() {
   const messages = await prisma.message.findMany({
-    orderBy: {
-      createdAt: "asc"
-    },
+    orderBy: [{ createdAt: "asc" }, { id: "asc" }],
     include: messageInclude
   });
 
@@ -92,13 +46,18 @@ export async function GET() {
 }
 
 export async function POST(request: Request) {
-  const parsed = createMessageSchema.safeParse(await request.json());
+  const startedAt = performance.now();
+  const receivedAt = Date.now();
+  const parsed = createMessageSchema.safeParse(await request.json().catch(() => null));
 
   if (!parsed.success) {
     return NextResponse.json({ error: parsed.error.flatten() }, { status: 400 });
   }
 
   const messageInputs = getMessageInputs(parsed.data);
+  const clientIds = messageInputs
+    .map((message) => message.clientId)
+    .filter((clientId): clientId is string => Boolean(clientId));
   const replyTargetIds = [
     ...new Set(
       messageInputs
@@ -107,41 +66,26 @@ export async function POST(request: Request) {
     )
   ];
 
-  if (replyTargetIds.length > 0) {
-    const repliedMessages = await prisma.message.findMany({
-      where: {
-        id: {
-          in: replyTargetIds
-        }
-      },
-      select: { id: true }
-    });
-
-    if (repliedMessages.length !== replyTargetIds.length) {
-      return NextResponse.json({ error: "Reply target does not exist." }, { status: 400 });
-    }
-  }
-
-  const provisionalMessages = messageInputs.map(createProvisionalMessage).filter((message) => message !== null);
-  const clientIds = messageInputs
-    .map((message) => message.clientId)
-    .filter((clientId): clientId is string => Boolean(clientId));
-  const persistencePromise =
-    messageInputs.length === 1
-      ? createStoredMessage(messageInputs[0]).then((message) => [message])
-      : prisma.$transaction(messageInputs.map(createStoredMessage));
-  const provisionalNotificationPromise =
-    provisionalMessages.length > 0
-      ? notifyMessagesChanged({
-          type: "created",
-          message: provisionalMessages.length === 1 ? provisionalMessages[0] : undefined,
-          messages: provisionalMessages.length > 1 ? provisionalMessages : undefined
-        })
-      : Promise.resolve();
   let messages: Awaited<ReturnType<typeof createStoredMessage>>[];
 
   try {
-    [messages] = await Promise.all([persistencePromise, provisionalNotificationPromise]);
+    if (replyTargetIds.length > 0) {
+      const repliedMessages = await prisma.message.findMany({
+        where: { id: { in: replyTargetIds } },
+        select: { id: true }
+      });
+
+      if (repliedMessages.length !== replyTargetIds.length) {
+        after(() => notifyMessagesChanged({ type: "failed", clientIds }));
+        return NextResponse.json({ error: "Reply target does not exist." }, { status: 400 });
+      }
+    }
+
+    messages = messageInputs.length === 1
+      ? [await createStoredMessage(messageInputs[0], new Date(receivedAt))]
+      : await prisma.$transaction(messageInputs.map((message, index) =>
+          createStoredMessage(message, new Date(receivedAt + index))
+        ));
   } catch (error) {
     if (clientIds.length > 0) {
       after(() => notifyMessagesChanged({ type: "failed", clientIds }));
@@ -161,9 +105,8 @@ export async function POST(request: Request) {
     })
   );
 
-  if ("messages" in parsed.data) {
-    return NextResponse.json({ messages }, { status: 201 });
-  }
-
-  return NextResponse.json({ message: messages[0] }, { status: 201 });
+  return NextResponse.json("messages" in parsed.data ? { messages } : { message: messages[0] }, {
+    status: 201,
+    headers: { "Server-Timing": `persist;dur=${(performance.now() - startedAt).toFixed(1)}` }
+  });
 }

@@ -1,24 +1,33 @@
 import Pusher from "pusher";
+import { Agent } from "node:https";
+import { encodeRealtimePayload } from "@/lib/realtime-payload";
 import { PUSHER_CHANNEL, PUSHER_EVENT_MESSAGES_CHANGED } from "@/lib/realtime";
 
 let pusherServer: Pusher | null = null;
 
+export function getRealtimeConfig() {
+  const key = process.env.NEXT_PUBLIC_PUSHER_KEY?.trim();
+  const cluster = (process.env.PUSHER_CLUSTER || process.env.NEXT_PUBLIC_PUSHER_CLUSTER)?.trim();
+  return key && cluster && process.env.PUSHER_APP_ID && process.env.PUSHER_SECRET ? { key, cluster } : null;
+}
+
 function getPusherServer() {
   const appId = process.env.PUSHER_APP_ID;
-  const key = process.env.NEXT_PUBLIC_PUSHER_KEY;
   const secret = process.env.PUSHER_SECRET;
-  const cluster = process.env.PUSHER_CLUSTER ?? process.env.NEXT_PUBLIC_PUSHER_CLUSTER;
+  const config = getRealtimeConfig();
 
-  if (!appId || !key || !secret || !cluster) {
+  if (!appId || !secret || !config) {
     return null;
   }
 
   pusherServer ??= new Pusher({
     appId,
-    key,
+    key: config.key,
     secret,
-    cluster,
-    useTLS: true
+    cluster: config.cluster,
+    useTLS: true,
+    timeout: 2500,
+    agent: new Agent({ keepAlive: true })
   });
 
   return pusherServer;
@@ -42,7 +51,7 @@ export async function notifyMessagesChanged(payload: {
   try {
     await triggerRealtimeEvent(PUSHER_EVENT_MESSAGES_CHANGED, payload);
   } catch (error) {
-    console.error("Message realtime notification failed", error);
+    console.error("Message realtime notification failed", error instanceof Error ? error.message : "Unknown error");
   }
 }
 
@@ -53,10 +62,22 @@ export async function triggerRealtimeEvent(eventName: string, payload: Record<st
     return false;
   }
 
-  await pusher.trigger(PUSHER_CHANNEL, eventName, {
+  const event = {
     ...payload,
     at: new Date().toISOString()
-  });
+  };
+  const parts = encodeRealtimePayload(eventName, event);
+  if (parts.length === 1) {
+    await pusher.trigger(PUSHER_CHANNEL, parts[0].name, parts[0].data);
+  } else {
+    const batches = [];
+    for (let offset = 0; offset < parts.length; offset += 10) {
+      batches.push(pusher.triggerBatch(parts.slice(offset, offset + 10).map((part) => ({
+        channel: PUSHER_CHANNEL, name: part.name, data: part.data
+      }))));
+    }
+    await Promise.all(batches);
+  }
 
   return true;
 }
