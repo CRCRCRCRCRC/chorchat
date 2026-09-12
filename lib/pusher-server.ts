@@ -25,8 +25,14 @@ function getPusherServer() {
 }
 
 export async function notifyMessagesChanged(payload: {
-  type: "created" | "edited" | "recalled" | "read" | "reacted" | "pinned";
+  type: "created" | "edited" | "recalled" | "read" | "reacted" | "pinned" | "failed";
   id?: string;
+  clientId?: string;
+  clientIds?: string[];
+  message?: unknown;
+  messages?: unknown[];
+  reader?: "CHEN" | "ZUO";
+  readAt?: string;
 }) {
   try {
     await triggerRealtimeEvent(PUSHER_EVENT_MESSAGES_CHANGED, payload);

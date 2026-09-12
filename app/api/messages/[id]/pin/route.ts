@@ -44,6 +44,6 @@ export async function PATCH(request: Request, context: RouteContext) {
     include: messageInclude
   });
 
-  after(() => notifyMessagesChanged({ type: "pinned", id }));
+  after(() => notifyMessagesChanged({ type: "pinned", id, message }));
   return NextResponse.json({ message });
 }

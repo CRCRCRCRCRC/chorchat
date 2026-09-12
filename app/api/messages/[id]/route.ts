@@ -55,7 +55,7 @@ export async function PATCH(request: Request, context: RouteContext) {
     include: messageInclude
   });
 
-  after(() => notifyMessagesChanged({ type: "edited", id: message.id }));
+  after(() => notifyMessagesChanged({ type: "edited", id: message.id, message }));
 
   return NextResponse.json({ message });
 }
@@ -106,7 +106,7 @@ export async function DELETE(request: Request, context: RouteContext) {
     });
   });
 
-  after(() => notifyMessagesChanged({ type: "recalled", id: message.id }));
+  after(() => notifyMessagesChanged({ type: "recalled", id: message.id, message }));
 
   return NextResponse.json({ message });
 }

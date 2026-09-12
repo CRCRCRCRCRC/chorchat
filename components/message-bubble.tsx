@@ -183,15 +183,29 @@ function MessageBubbleComponent({
   const editable = isOwn && !isClientOnly && canEditMessage(message.createdAt, message.recalledAt);
   const imageUrls = isRecalled ? [] : getMessageImageUrls(message);
   const hasVisibleContent = !isRecalled && (message.text || imageUrls.length > 0);
-  const hasStatus = Boolean(message.editedAt && !isRecalled) || Boolean(message.clientStatus) || Boolean(message.pinnedAt);
-  const showMeta = showTimestamp || hasStatus;
   const previewUrl = !isRecalled ? getFirstUrl(message.text) : null;
   const [isMenuOpen, setIsMenuOpen] = useState(false);
+  const [showSendingStatus, setShowSendingStatus] = useState(false);
   const menuRef = useRef<HTMLDivElement | null>(null);
+  const hasStatus =
+    Boolean(message.editedAt && !isRecalled) ||
+    message.clientStatus === "failed" ||
+    showSendingStatus ||
+    Boolean(message.pinnedAt);
+  const showMeta = showTimestamp || hasStatus;
   const reactionGroups = REACTION_EMOJIS.map((emoji) => ({
     emoji,
     reactions: (message.reactions ?? []).filter((reaction) => reaction.emoji === emoji)
   })).filter((group) => group.reactions.length > 0);
+
+  useEffect(() => {
+    if (message.clientStatus !== "sending") {
+      return;
+    }
+
+    const timer = window.setTimeout(() => setShowSendingStatus(true), 700);
+    return () => window.clearTimeout(timer);
+  }, [message.clientStatus]);
 
   useEffect(() => {
     if (!isMenuOpen) {
@@ -243,7 +257,7 @@ function MessageBubbleComponent({
               {message.pinnedAt && !isRecalled ? (
                 <span className="inline-flex items-center gap-1"><Pin size={11} />已置頂</span>
               ) : null}
-              {message.clientStatus === "sending" ? <span>傳送中</span> : null}
+              {message.clientStatus === "sending" && showSendingStatus ? <span>傳送中</span> : null}
               {message.clientStatus === "failed" ? <span className="text-red-600">傳送失敗</span> : null}
             </div>
           ) : null}
@@ -252,7 +266,7 @@ function MessageBubbleComponent({
             className={clsx(
               "rounded-lg px-3 py-2 shadow-sm",
               isOwn ? "bg-brand text-white" : "bg-white text-ink",
-              message.clientStatus === "sending" && "opacity-75",
+              message.clientStatus === "sending" && showSendingStatus && "opacity-75",
               message.clientStatus === "failed" && "border border-red-200 bg-red-50 text-red-700",
               isRecalled && "border border-dashed border-slate-300 bg-transparent text-slate-500 shadow-none"
             )}

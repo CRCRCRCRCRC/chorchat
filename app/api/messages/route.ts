@@ -9,6 +9,7 @@ export const runtime = "nodejs";
 const messageInputSchema = z
   .object({
     sender: z.enum(["CHEN", "ZUO"]),
+    clientId: z.string().max(100).regex(/^optimistic-[a-zA-Z0-9-]+$/).optional(),
     text: z.string().trim().max(4000).optional(),
     imageUrl: z.string().url().optional(),
     imageUrls: z.array(z.string().url()).max(30).optional(),
@@ -49,6 +50,34 @@ function createStoredMessage(message: MessageInput) {
     },
     include: messageInclude
   });
+}
+
+function createProvisionalMessage(message: MessageInput) {
+  if (!message.clientId) {
+    return null;
+  }
+
+  const imageUrls = getImageUrls(message);
+  const createdAt = new Date().toISOString();
+
+  return {
+    id: message.clientId,
+    sender: message.sender,
+    text: message.text?.trim() || null,
+    imageUrl: imageUrls[0] ?? null,
+    imageUrls,
+    createdAt,
+    updatedAt: createdAt,
+    editedAt: null,
+    recalledAt: null,
+    readAt: null,
+    pinnedAt: null,
+    pinnedBy: null,
+    replyToMessageId: message.replyToMessageId ?? null,
+    replyTo: null,
+    reactions: [],
+    clientStatus: "sending"
+  };
 }
 
 export async function GET() {
@@ -93,12 +122,44 @@ export async function POST(request: Request) {
     }
   }
 
-  const messages =
+  const provisionalMessages = messageInputs.map(createProvisionalMessage).filter((message) => message !== null);
+  const clientIds = messageInputs
+    .map((message) => message.clientId)
+    .filter((clientId): clientId is string => Boolean(clientId));
+  const persistencePromise =
     messageInputs.length === 1
-      ? [await createStoredMessage(messageInputs[0])]
-      : await prisma.$transaction(messageInputs.map(createStoredMessage));
+      ? createStoredMessage(messageInputs[0]).then((message) => [message])
+      : prisma.$transaction(messageInputs.map(createStoredMessage));
+  const provisionalNotificationPromise =
+    provisionalMessages.length > 0
+      ? notifyMessagesChanged({
+          type: "created",
+          message: provisionalMessages.length === 1 ? provisionalMessages[0] : undefined,
+          messages: provisionalMessages.length > 1 ? provisionalMessages : undefined
+        })
+      : Promise.resolve();
+  let messages: Awaited<ReturnType<typeof createStoredMessage>>[];
 
-  after(() => notifyMessagesChanged({ type: "created", id: messages[0]?.id }));
+  try {
+    [messages] = await Promise.all([persistencePromise, provisionalNotificationPromise]);
+  } catch (error) {
+    if (clientIds.length > 0) {
+      after(() => notifyMessagesChanged({ type: "failed", clientIds }));
+    }
+
+    throw error;
+  }
+
+  after(() =>
+    notifyMessagesChanged({
+      type: "created",
+      id: messages[0]?.id,
+      clientId: clientIds.length === 1 ? clientIds[0] : undefined,
+      clientIds: clientIds.length > 1 ? clientIds : undefined,
+      message: messages.length === 1 ? messages[0] : undefined,
+      messages: messages.length > 1 ? messages : undefined
+    })
+  );
 
   if ("messages" in parsed.data) {
     return NextResponse.json({ messages }, { status: 201 });

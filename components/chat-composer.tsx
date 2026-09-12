@@ -77,7 +77,7 @@ export function ChatComposer({
     });
   }
 
-  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
+  function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
 
     if (!canSubmit) {
@@ -95,7 +95,7 @@ export function ChatComposer({
       fileInputRef.current.value = "";
     }
 
-    await onSubmit({
+    void onSubmit({
       text: submittedText,
       files: submittedFiles
     });

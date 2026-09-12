@@ -12,7 +12,11 @@ import { clearBrowserUnreadBadge, updateBrowserUnreadBadge } from "@/lib/browser
 import { formatPresence, usePresence } from "@/lib/presence-client";
 import { acquireRealtimeChannel } from "@/lib/pusher-client";
 import type { ReactionEmoji } from "@/lib/reactions";
-import { PUSHER_EVENT_MESSAGES_CHANGED, PUSHER_EVENT_TYPING_CHANGED } from "@/lib/realtime";
+import {
+  PUSHER_EVENT_MESSAGES_CHANGED,
+  PUSHER_EVENT_TYPING_CHANGED,
+  type MessagesChangedEvent
+} from "@/lib/realtime";
 import { getMessageMinuteKey } from "@/lib/time";
 import { OTHER_SENDER, SENDER_LABEL, type Message, type Sender } from "@/lib/types";
 
@@ -23,6 +27,7 @@ type ChatRoomProps = {
 
 type CreateMessageRequest = {
   sender: Sender;
+  clientId: string;
   text?: string;
   imageUrl?: string;
   imageUrls?: string[];
@@ -80,6 +85,31 @@ function mergeLoadedMessages(currentMessages: Message[], loadedMessages: Message
 
   const mergedMessages = sortMessagesByCreatedAt([...loadedMessages, ...pendingMessages]);
   return areMessagesEquivalent(currentMessages, mergedMessages) ? currentMessages : mergedMessages;
+}
+
+function normalizeRealtimeMessage(message: Message): Message {
+  return {
+    ...message,
+    imageUrls: message.imageUrls ?? (message.imageUrl ? [message.imageUrl] : []),
+    reactions: message.reactions ?? []
+  };
+}
+
+function mergeRealtimeMessages(currentMessages: Message[], realtimeMessages: Message[], replacedClientIds: string[] = []) {
+  const normalizedMessages = realtimeMessages.map(normalizeRealtimeMessage);
+  const realtimeById = new Map(normalizedMessages.map((message) => [message.id, message]));
+  const replacedClientIdSet = new Set(replacedClientIds);
+  const retainedMessages = currentMessages.filter((message) => !replacedClientIdSet.has(message.id));
+  const currentIds = new Set(retainedMessages.map((message) => message.id));
+  const updatedMessages = retainedMessages.map((message) => realtimeById.get(message.id) ?? message);
+
+  normalizedMessages.forEach((message) => {
+    if (!currentIds.has(message.id)) {
+      updatedMessages.push(message);
+    }
+  });
+
+  return sortMessagesByCreatedAt(updatedMessages);
 }
 
 function getOptimisticId() {
@@ -402,7 +432,55 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
         schedulePoll(isConnected ? MESSAGE_REALTIME_HEALTH_CHECK_MS : 0);
       }
     };
-    const handleMessagesChanged = () => {
+    const handleMessagesChanged = (event: MessagesChangedEvent) => {
+      if (event.type === "failed") {
+        const failedClientIds = new Set(event.clientIds ?? (event.clientId ? [event.clientId] : []));
+
+        if (failedClientIds.size > 0) {
+          setMessages((currentMessages) =>
+            currentMessages.filter((message) => !failedClientIds.has(message.id))
+          );
+        }
+
+        return;
+      }
+
+      if (event.type === "read" && event.reader && event.readAt) {
+        setMessages((currentMessages) =>
+          currentMessages.map((message) =>
+            message.sender !== event.reader && !message.clientStatus
+              ? { ...message, readAt: message.readAt ?? event.readAt ?? null }
+              : message
+          )
+        );
+        return;
+      }
+
+      const realtimeMessages = event.messages ?? (event.message ? [event.message] : []);
+
+      if (realtimeMessages.length > 0) {
+        if (event.type === "created") {
+          const incomingMessages = realtimeMessages.filter((message) => message.sender !== sender);
+
+          if (incomingMessages.length > 0) {
+            const replacedClientIds = event.clientIds ?? (event.clientId ? [event.clientId] : []);
+
+            if (replacedClientIds.length > 0) {
+              incomingMessages.forEach((message) => knownMessageIdsRef.current.add(message.id));
+            }
+
+            setMessages((currentMessages) =>
+              mergeRealtimeMessages(currentMessages, incomingMessages, replacedClientIds)
+            );
+          }
+
+          return;
+        }
+
+        setMessages((currentMessages) => mergeRealtimeMessages(currentMessages, realtimeMessages));
+        return;
+      }
+
       void loadMessages().catch(() => undefined);
     };
     const handleTypingChanged = (event: { sender: Sender; isTyping: boolean }) => {
@@ -958,7 +1036,7 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
     }
 
     startProgrammaticScrollTracking(1400);
-    setMessages((currentMessages) => sortMessagesByCreatedAt([...currentMessages, ...optimisticMessages]));
+    setMessages((currentMessages) => [...currentMessages, ...optimisticMessages]);
     window.requestAnimationFrame(() => scrollToLatest("smooth"));
     setReplyTo(null);
 
@@ -975,6 +1053,7 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
       try {
         await persistOptimisticMessage(textTempId, {
           sender,
+          clientId: textTempId,
           text,
           replyToMessageId: replyTarget?.id
         });
@@ -996,6 +1075,7 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
             imageTempId,
             {
               sender,
+              clientId: imageTempId,
               imageUrl: uploadResult.urls[0],
               imageUrls: uploadResult.urls,
               replyToMessageId: textTempId ? undefined : replyTarget?.id

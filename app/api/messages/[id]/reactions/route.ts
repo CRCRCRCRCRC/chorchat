@@ -60,6 +60,6 @@ export async function POST(request: Request, context: RouteContext) {
     include: messageInclude
   });
 
-  after(() => notifyMessagesChanged({ type: "reacted", id }));
+  after(() => notifyMessagesChanged({ type: "reacted", id, message: updatedMessage }));
   return NextResponse.json({ message: updatedMessage });
 }

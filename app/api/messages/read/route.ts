@@ -1,4 +1,4 @@
-import { NextResponse } from "next/server";
+import { after, NextResponse } from "next/server";
 import { z } from "zod";
 import { prisma } from "@/lib/prisma";
 import { notifyMessagesChanged } from "@/lib/pusher-server";
@@ -16,6 +16,7 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: parsed.error.flatten() }, { status: 400 });
   }
 
+  const readAt = new Date();
   const result = await prisma.message.updateMany({
     where: {
       sender: {
@@ -24,12 +25,18 @@ export async function POST(request: Request) {
       readAt: null
     },
     data: {
-      readAt: new Date()
+      readAt
     }
   });
 
   if (result.count > 0) {
-    await notifyMessagesChanged({ type: "read" });
+    after(() =>
+      notifyMessagesChanged({
+        type: "read",
+        reader: parsed.data.sender,
+        readAt: readAt.toISOString()
+      })
+    );
   }
 
   return NextResponse.json({
