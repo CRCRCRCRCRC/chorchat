@@ -46,6 +46,8 @@ cp .env.example .env
 
 ```env
 DATABASE_URL="postgresql://USER:PASSWORD@HOST:PORT/DATABASE?sslmode=require"
+# 選填；migration 會優先使用 direct URL。Neon Vercel Integration 通常會提供 DATABASE_URL_UNPOOLED。
+DIRECT_URL="postgresql://USER:PASSWORD@DIRECT_HOST:PORT/DATABASE?sslmode=require"
 CHORCHAT_AUTH_USER="chorchat"
 CHORCHAT_AUTH_PASSWORD="change-this-password"
 BLOB_READ_WRITE_TOKEN="vercel_blob_rw_xxxxxxxxxxxxxxxxx"
@@ -91,7 +93,7 @@ npm run dev
 npm run vercel-build
 ```
 
-此指令會在每次部署時先執行 production migration，再建立 Next.js 正式版本。若要手動執行 migration：
+此指令會在每次部署時先使用 Neon direct connection 執行 production migration，再建立 Next.js 正式版本。它會優先使用 `DIRECT_URL` 或 `DATABASE_URL_UNPOOLED`；若兩者都沒有，會自動從 Neon pooled hostname 移除 `-pooler`，不需要額外設定。若要手動執行 migration：
 
 ```bash
 npm run db:deploy
