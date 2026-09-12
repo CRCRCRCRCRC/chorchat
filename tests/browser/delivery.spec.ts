@@ -11,18 +11,23 @@ async function chatPair(browser: Browser, options: {
   sameIdentity?: boolean;
   initialHistoryDelayMs?: number;
   history?: Message[];
+  dropFirstMobileConnection?: boolean;
+  failProbePublish?: boolean;
 } = {}) {
   const sockets = new Set<WebSocketRoute>();
+  const droppedSockets = new Set<WebSocketRoute>();
   const saved: Message[] = [...(options.history ?? [])];
   const contexts: BrowserContext[] = [];
   const errors: string[] = [];
-  const metrics = { persisted: 0, polls: 0, clientEvents: 0 };
+  const metrics = { persisted: 0, polls: 0, clientEvents: 0, mobileConnections: 0, probes: 0 };
   let rejectSubscription = options.rejectSubscription ?? false;
   const pending = new Set<Promise<void>>();
 
   function publish(event: string, payload: Record<string, unknown>) {
     for (const part of encodeRealtimePayload(event, payload)) {
-      for (const socket of sockets) socket.send(JSON.stringify({ event: part.name, channel: "private-chorchat-main", data: JSON.stringify(part.data) }));
+      for (const socket of sockets) {
+        if (!droppedSockets.has(socket)) socket.send(JSON.stringify({ event: part.name, channel: "private-chorchat-main", data: JSON.stringify(part.data) }));
+      }
     }
   }
 
@@ -33,6 +38,10 @@ async function chatPair(browser: Browser, options: {
     await context.addInitScript((identity) => localStorage.setItem("chorchat:sender", identity), sender);
     await context.addInitScript(installNotificationProbe);
     await context.routeWebSocket(/wss:\/\/ws-.*\.pusher\.com\//, (socket) => {
+      if (mobile) {
+        metrics.mobileConnections++;
+        if (options.dropFirstMobileConnection && metrics.mobileConnections === 1) droppedSockets.add(socket);
+      }
       socket.send(JSON.stringify({ event: "pusher:connection_established", data: JSON.stringify({ socket_id: `${Math.random()}.1`, activity_timeout: 120 }) }));
       socket.onMessage((raw) => {
         const message = JSON.parse(raw.toString());
@@ -50,6 +59,12 @@ async function chatPair(browser: Browser, options: {
       const path = new URL(request.url()).pathname;
       const json = (body: unknown, status = 200) => route.fulfill({ json: body, status });
       if (path === "/api/realtime" && request.method() === "GET") return json({ config: { key: "test-key", cluster: "ap3" } });
+      if (path === "/api/realtime/probe") {
+        metrics.probes++;
+        if (options.failProbePublish) return json({ published: false }, 503);
+        publish("connection:probe", { token: request.postDataJSON().token });
+        return json({ published: true });
+      }
       if (path === "/api/pusher/auth") return json(rejectSubscription ? { error: "Test authorization failure" } : { auth: "test-key:test-signature" }, rejectSubscription ? 403 : 200);
       if (path === "/api/realtime") {
         const input = request.postDataJSON() as MessageInput;
@@ -105,9 +120,61 @@ async function chatPair(browser: Browser, options: {
   return {
     chen, zuo, metrics, errors,
     allowSubscription: () => { rejectSubscription = false; },
-    close: async () => { await Promise.allSettled([...pending]); await Promise.all(contexts.map((context) => context.close())); }
+    close: async () => {
+      await Promise.allSettled([...pending]);
+      // Keep context routes active while pages unload, including late focus requests.
+      for (const context of contexts) {
+        await Promise.all(context.pages().map((page) => page.close()));
+        await context.close();
+      }
+    }
   };
 }
+
+test("a subscribed device with a silently broken receive path reconnects and receives both directions before storage", async ({ browser }, testInfo) => {
+  const pair = await chatPair(browser, { sameIdentity: true, dropFirstMobileConnection: true, persistenceDelay: 9000 });
+  try {
+    await expect.poll(() => pair.metrics.mobileConnections, { timeout: 7000 }).toBe(2);
+    await expect(pair.zuo.getByRole("status")).toHaveCount(0);
+    await pair.zuo.getByText("連線檢查", { exact: true }).click();
+    await expect(pair.zuo.getByText("已驗證收到推送", { exact: true })).toBeVisible();
+    for (const [sending, receiving] of [[pair.chen, pair.zuo], [pair.zuo, pair.chen]]) {
+      const text = `recovered receive path ${sending === pair.chen ? "A to B" : "B to A"}`;
+      await sending.getByPlaceholder("輸入訊息").fill(text);
+      await sending.getByRole("button", { name: "送出訊息", exact: true }).click();
+      await expect(receiving.getByText(text, { exact: true })).toBeVisible({ timeout: 1000 });
+    }
+    expect(pair.metrics.persisted).toBe(0);
+    await expect(pair.zuo.getByText("伺服器推送（儲存前）", { exact: true })).toBeVisible();
+    await pair.zuo.screenshot({ path: testInfo.outputPath("receive-diagnostics.png") });
+    expect(pair.errors).toEqual([]);
+  } finally { await pair.close(); }
+});
+
+test("manual reconnect creates a new socket instead of leasing the same connection", async ({ browser }) => {
+  const pair = await chatPair(browser);
+  try {
+    await expect(pair.zuo.getByRole("status")).toHaveCount(0);
+    expect(pair.metrics.mobileConnections).toBe(1);
+    await pair.zuo.getByText("連線檢查", { exact: true }).click();
+    await pair.zuo.getByRole("button", { name: "重建連線", exact: true }).click();
+    await expect.poll(() => pair.metrics.mobileConnections).toBe(2);
+    await expect(pair.zuo.getByText("已驗證收到推送", { exact: true })).toBeVisible();
+    expect(pair.errors).toEqual([]);
+  } finally { await pair.close(); }
+});
+
+test("probe publish failures retain polling without repeatedly disconnecting a healthy socket", async ({ browser }) => {
+  const pair = await chatPair(browser, { failProbePublish: true });
+  try {
+    await pair.zuo.getByText("連線檢查", { exact: true }).click();
+    await expect(pair.zuo.getByText("探測要求失敗或逾時", { exact: true })).toBeVisible();
+    const probes = pair.metrics.probes;
+    await expect.poll(() => pair.metrics.probes, { timeout: 7000 }).toBeGreaterThan(probes);
+    expect(pair.metrics.mobileConnections).toBe(1);
+    expect(pair.errors).toEqual([]);
+  } finally { await pair.close(); }
+});
 
 test("incoming messages remain visible while only the receiving device is loading history", async ({ browser }) => {
   const pair = await chatPair(browser, { initialHistoryDelayMs: 5000 });

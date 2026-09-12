@@ -19,6 +19,8 @@ async function connect() {
   sharedPusher = new Pusher(config.key, {
     cluster: config.cluster,
     forceTLS: true,
+    activityTimeout: 30000,
+    pongTimeout: 5000,
     channelAuthorization: { endpoint: "/api/pusher/auth", transport: "ajax" }
   });
   sharedChannel = sharedPusher.subscribe(PUSHER_CHANNEL);
@@ -86,4 +88,10 @@ export function triggerRealtimeClientEvent(eventName: string, payload: Record<st
 
 export function isRealtimeSubscribed(lease: NonNullable<Awaited<ReturnType<typeof acquireRealtimeChannel>>>) {
   return lease.pusher.connection.state === "connected" && lease.channel.subscribed;
+}
+
+export function reconnectRealtime() {
+  // Reacquiring a lease alone keeps the same socket, including a stalled one.
+  sharedPusher?.disconnect();
+  sharedPusher?.connect();
 }

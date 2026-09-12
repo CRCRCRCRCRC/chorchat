@@ -6,6 +6,7 @@ export const PUSHER_EVENT_TYPING_CHANGED = "typing:changed";
 export const PUSHER_EVENT_CALL_SIGNAL = "call:signal";
 export const PUSHER_EVENT_CLIENT_MESSAGE_PREVIEW = "client-message-preview";
 export const PUSHER_EVENT_CLIENT_MESSAGE_FAILED = "client-message-failed";
+export const PUSHER_EVENT_PROBE = "connection:probe";
 
 export type ClientMessagePreviewEvent = {
   messages: Message[];

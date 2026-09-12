@@ -4,13 +4,15 @@ import { ArrowDown, ArrowDownToLine, ArrowLeft, Images, Pin, RefreshCw, Search }
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ChatComposer, type ComposerPayload } from "@/components/chat-composer";
 import { ChatToolsDialog, type ChatToolMode } from "@/components/chat-tools-dialog";
+import { ConnectionDiagnostics, type ReceiveDiagnostic, type SendDiagnostic } from "@/components/connection-diagnostics";
 import { ImageLightbox } from "@/components/image-lightbox";
 import { MessageBubble } from "@/components/message-bubble";
 import { VoiceCall } from "@/components/voice-call";
 import { unlockAudio } from "@/lib/audio-client";
 import { clearBrowserUnreadBadge, updateBrowserUnreadBadge } from "@/lib/browser-badge";
 import { formatPresence, usePresence } from "@/lib/presence-client";
-import { acquireRealtimeChannel, isRealtimeSubscribed, triggerRealtimeClientEvent } from "@/lib/pusher-client";
+import { acquireRealtimeChannel, isRealtimeSubscribed, reconnectRealtime, triggerRealtimeClientEvent } from "@/lib/pusher-client";
+import { monitorRealtimeHealth, type RealtimeHealth } from "@/lib/realtime-health-client";
 import { mergeLoadedMessages, mergeRealtimeMessages, messageIdentity } from "@/lib/message-sync";
 import { useMessageNotificationSound } from "@/lib/message-notification-client";
 import type { ReactionEmoji } from "@/lib/reactions";
@@ -193,6 +195,11 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
   const [realtimeStatus, setRealtimeStatus] = useState<"connecting" | "ready" | "fallback">("connecting");
   const [realtimeAttempt, setRealtimeAttempt] = useState(0);
   const [relayError, setRelayError] = useState(false);
+  const [realtimeHealth, setRealtimeHealth] = useState<RealtimeHealth>({ state: "checking", reason: null, roundTripMs: null });
+  const [receivedDiagnostic, setReceivedDiagnostic] = useState<ReceiveDiagnostic | null>(null);
+  const [sentDiagnostic, setSentDiagnostic] = useState<SendDiagnostic | null>(null);
+  const pendingReceiveRef = useRef<{ source: ReceiveDiagnostic["source"]; at: number } | null>(null);
+  const checkRealtimeRef = useRef<(() => void) | null>(null);
   const chatScrollRef = useRef<HTMLElement | null>(null);
   const hasInitialScrolledRef = useRef(false);
   const latestRenderedMessageIdRef = useRef<string | null>(null);
@@ -232,6 +239,25 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
     });
   }
 
+  function handleReconnect() {
+    reconnectRealtime();
+    setRelayError(false);
+    setRealtimeAttempt((attempt) => attempt + 1);
+  }
+
+  const trackReceivedMessages = useCallback((incoming: Message[], source: "client" | "server" | "poll") => {
+    const newMessage = incoming.find((message) =>
+      !knownMessageIdsRef.current.has(messageIdentity(message)) &&
+      !locallySentIdsRef.current.has(messageIdentity(message)) && !message.recalledAt
+    );
+    if (!newMessage) return;
+    pendingReceiveRef.current ??= {
+      source: source === "server" ? newMessage.clientStatus ? "server-preview" : "server-stored" : source,
+      at: performance.now()
+    };
+    if (source === "poll") checkRealtimeRef.current?.();
+  }, []);
+
   const loadMessages = useCallback(async () => {
     if (loadMessagesPromiseRef.current) {
       return loadMessagesPromiseRef.current;
@@ -251,6 +277,8 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
       if (!hasInitializedMessageTrackingRef.current) {
         data.messages.forEach((message) => knownMessageIdsRef.current.add(messageIdentity(message)));
         hasInitializedMessageTrackingRef.current = true;
+      } else {
+        trackReceivedMessages(data.messages, "poll");
       }
       setMessages((currentMessages) => mergeLoadedMessages(currentMessages, data.messages));
     })();
@@ -264,7 +292,7 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
         loadMessagesPromiseRef.current = null;
       }
     }
-  }, []);
+  }, [trackReceivedMessages]);
 
   useEffect(() => {
     let isMounted = true;
@@ -372,6 +400,7 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
       if (!realtimeLease) {
         realtimeConnectedRef.current = false;
         setRealtimeStatus("fallback");
+        setRealtimeHealth({ state: "degraded", reason: "disconnected", roundTripMs: null });
         schedulePoll();
         retryTimer = window.setTimeout(() => setRealtimeAttempt((attempt) => attempt + 1), 5000);
         return;
@@ -380,12 +409,10 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
       const { pusher, channel } = realtimeLease;
       const handleStateChange = () => {
         const isConnected = isRealtimeSubscribed(realtimeLease);
-        const wasConnected = realtimeConnectedRef.current;
-        realtimeConnectedRef.current = isConnected;
-        setRealtimeStatus(isConnected ? "ready" : "connecting");
         if (isConnected) window.clearTimeout(retryTimer);
-
-        if (wasConnected !== isConnected) {
+        if (!isConnected) {
+          realtimeConnectedRef.current = false;
+          setRealtimeStatus("connecting");
           schedulePoll(0);
         }
       };
@@ -439,6 +466,7 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
             );
 
             if (incomingMessages.length > 0) {
+              trackReceivedMessages(incomingMessages, "server");
               const replacedClientIds = event.clientIds ?? (event.clientId ? [event.clientId] : []);
 
               setMessages((currentMessages) =>
@@ -477,6 +505,7 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
         );
 
         if (incomingMessages.length > 0) {
+          trackReceivedMessages(incomingMessages, "client");
           setMessages((currentMessages) => mergeRealtimeMessages(currentMessages, incomingMessages));
         }
       };
@@ -496,7 +525,18 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
         channel.subscribe();
       }
 
+      const healthMonitor = monitorRealtimeHealth(realtimeLease, (health) => {
+        const wasConnected = realtimeConnectedRef.current;
+        realtimeConnectedRef.current = health.state === "healthy" && isRealtimeSubscribed(realtimeLease);
+        setRealtimeHealth(health);
+        setRealtimeStatus(health.state === "healthy" ? "ready" : health.state === "checking" ? "connecting" : "fallback");
+        if (wasConnected !== realtimeConnectedRef.current) schedulePoll(0);
+      });
+      checkRealtimeRef.current = healthMonitor.check;
+
       cleanupChannel = () => {
+        healthMonitor.stop();
+        checkRealtimeRef.current = null;
         realtimeConnectedRef.current = false;
         if (otherTypingTimerRef.current) {
           window.clearTimeout(otherTypingTimerRef.current);
@@ -519,7 +559,7 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
       window.clearTimeout(retryTimer);
       cleanupChannel?.();
     };
-  }, [loadMessages, sender, realtimeAttempt]);
+  }, [loadMessages, sender, realtimeAttempt, trackReceivedMessages]);
 
   useEffect(() => {
     const optimisticImageUrls = optimisticImageUrlsRef.current;
@@ -620,6 +660,11 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
 
   useLayoutEffect(() => {
     latestRenderedMessageIdRef.current = messages.at(-1)?.id ?? null;
+    if (pendingReceiveRef.current) {
+      const { source, at } = pendingReceiveRef.current;
+      pendingReceiveRef.current = null;
+      setReceivedDiagnostic({ source, renderMs: Math.round(performance.now() - at) });
+    }
   }, [messages]);
 
   useLayoutEffect(() => {
@@ -837,12 +882,20 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
     localImageCount = 0
   ) {
     // Publish independently: neither DB startup nor an unrelated Pusher setting may gate delivery.
+    const startedAt = performance.now();
+    setSentDiagnostic({ id: tempId, relayMs: null, saveMs: null, relayFailed: false });
+    const recordRelay = (ok: boolean) => {
+      setRelayError(!ok);
+      setSentDiagnostic((current) => current?.id === tempId ? {
+        ...current, relayMs: Math.round(performance.now() - startedAt), relayFailed: !ok
+      } : current);
+    };
     void fetch("/api/realtime", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(requestBody),
       signal: AbortSignal.timeout(5000)
-    }).then((response) => setRelayError(!response.ok)).catch(() => setRelayError(true));
+    }).then((response) => recordRelay(response.ok)).catch(() => recordRelay(false));
 
     const response = await fetch("/api/messages", {
       method: "POST",
@@ -857,6 +910,9 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
     }
 
     const data = (await response.json()) as { message: Message };
+    setSentDiagnostic((current) => current?.id === tempId ? {
+      ...current, saveMs: Math.round(performance.now() - startedAt)
+    } : current);
 
     for (let index = 0; index < localImageCount; index += 1) {
       const optimisticImageUrl = optimisticImageUrlsRef.current.get(`${tempId}-${index}`);
@@ -1249,7 +1305,7 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
       {realtimeStatus !== "ready" || relayError ? (
         <div role="status" className="flex shrink-0 items-center justify-center gap-3 bg-amber-50 px-3 py-1 text-xs text-amber-900">
           <span>{relayError ? "即時傳送暫時失敗，訊息仍會儲存並同步" : realtimeStatus === "connecting" ? "正在連接聊天室…" : "即時連線中斷，正在重新連線"}</span>
-          <button type="button" className="shrink-0 underline" onClick={() => { setRelayError(false); setRealtimeAttempt((attempt) => attempt + 1); }}>重新連線</button>
+          <button type="button" className="shrink-0 underline" onClick={handleReconnect}>重新連線</button>
         </div>
       ) : null}
       <header className="border-b border-line bg-white/95 backdrop-blur">
@@ -1331,6 +1387,14 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
           </div>
         </nav>
       </header>
+
+      <ConnectionDiagnostics
+        health={realtimeHealth}
+        received={receivedDiagnostic}
+        sent={sentDiagnostic}
+        onCheck={() => checkRealtimeRef.current?.()}
+        onReconnect={handleReconnect}
+      />
 
       <section
         ref={chatScrollRef}

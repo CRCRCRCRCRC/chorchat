@@ -108,7 +108,9 @@ npm run db:deploy
 - 歷史訊息仍在載入時，已收到的新訊息仍會立即顯示，不會被載入畫面遮住。
 - 送出訊息時，同時呼叫 `/api/realtime` 即時轉送與 `/api/messages` 儲存；即使 Neon 正在啟動，接收端也不需要等資料庫完成才顯示訊息和未讀提醒。預覽尚未儲存時不開放編輯、回覆等操作。
 - `/api/realtime` 的 GET 僅提供公開 key 和 cluster。前後端共用伺服器的 cluster 設定，避免兩個 cluster 環境變數不一致而訂閱錯誤的節點；secret 不會傳給瀏覽器。
-- 必須成功訂閱聊天室才算即時連線就緒。授權失敗會顯示重連提示，並以 1.5 秒間隔補抓訊息，不會誤用正常連線的 15 秒檢查間隔。這些間隔不含 API 回應時間。
+- 即時連線必須成功訂閱，且本機實際收到 `/api/realtime/probe` 發送的隨機測試事件才算就緒。前景每 20 秒複查，回到分頁或輪詢發現漏接訊息時也會檢查；背景不發出探測。探測不存取 Neon。
+- 伺服器確認推送成功後，本機 1.5 秒仍未收到測試事件便重建 WebSocket，重建至少間隔 10 秒。探測 API 本身失敗時只啟用備援，不反覆切斷連線。異常時以 1.5 秒間隔補抓訊息，正常時每 15 秒核對資料；輪詢間隔不含 API 回應時間，不能保證故障期間仍是秒內送達。
+- 聊天室的「連線檢查」會顯示本機版本、接收測試、最近收件來源，以及本機轉送、儲存和畫面更新耗時。若 A 到 B 慢、反向正常，請傳送一則純文字後截下兩台的檢查資訊。收件來源區分裝置直送、儲存前推送、儲存後推送和輪詢補回；`輪詢補回` 表示補抓資料先抵達，可能是即時漏接或推送較慢。版本不同則先更新舊分頁。本機推送來回時間使用單一裝置的計時器，不受兩台時鐘不同步影響，但不是 A 到 B 的送達時間。
 - 同一則訊息的預覽、儲存結果和補抓資料會去重。長中文或多張圖片超過 Pusher 單事件 10KB 限制時，伺服器會分段傳送並由瀏覽器組回。
 - `vercel.json` 將 Functions 區域設為新加坡 `sin1`，對應目前 Neon 的新加坡區域。若日後移動資料庫，請一起調整 Functions 區域。[Vercel 區域文件](https://vercel.com/docs/functions/configuring-functions/region)。Build log 的建置機器位置與 Functions 執行位置是兩回事。
 - Chrome/Edge 開發者工具的 Network 中，`/api/realtime` 的 `Server-Timing: publish` 是伺服器向 Pusher 發布的時間，`/api/messages` 的 `Server-Timing: persist` 是儲存處理時間；兩者都不是另一支手機實際收到的時間。Pusher 的 Client Events 設定與訂閱事件請見 [Pusher 官方文件](https://pusher.com/docs/channels/using_channels/events/)。
@@ -121,12 +123,20 @@ npx playwright install chromium
 npm run test:e2e
 ```
 
-瀏覽器測試使用兩個獨立身分、桌機和手機視窗，模擬 Pusher 與資料庫，包含關閉 Client Events、儲存延遲 10 秒、訂閱失敗重連、即時未讀提醒和重複事件。測試不會存取正式聊天資料，也不代表正式環境的網路延遲。正式環境仍需兩支手機實測。
+瀏覽器測試使用兩個獨立分頁、桌機和手機視窗，模擬 Pusher 與資料庫，包含同身分登入、關閉 Client Events、儲存延遲 10 秒、訂閱失敗與靜默漏接重連、即時未讀提醒和重複事件。測試不會存取正式聊天資料，也不代表正式環境的網路延遲。正式環境仍需兩台裝置實測。
 
 Windows 已安裝 Edge 時，可省略 Chromium 下載，改用：
 
 ```powershell
 $env:PLAYWRIGHT_CHANNEL = "msedge"
+npm run test:e2e
+```
+
+WebKit 引擎回歸測試（不能取代實機 iPad Safari）：
+
+```powershell
+npx playwright install webkit
+$env:PLAYWRIGHT_BROWSER = "webkit"
 npm run test:e2e
 ```
 
