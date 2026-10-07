@@ -182,6 +182,7 @@ function MessageBubbleComponent({
   const isClientOnly = Boolean(message.clientStatus);
   const editable = isOwn && !isClientOnly && canEditMessage(message.createdAt, message.recalledAt);
   const imageUrls = isRecalled ? [] : getMessageImageUrls(message);
+  const isImageOnly = imageUrls.length > 0 && !message.text?.trim();
   const hasVisibleContent = !isRecalled && (message.text || imageUrls.length > 0);
   const previewUrl = !isRecalled ? getFirstUrl(message.text) : null;
   const [isMenuOpen, setIsMenuOpen] = useState(false);
@@ -242,12 +243,12 @@ function MessageBubbleComponent({
     <article
       id={`message-${message.id}`}
       className={clsx(
-        "group flex w-full scroll-mt-20 gap-2 transition",
+        "group flex w-full shrink-0 scroll-mt-20 gap-2 transition",
         isOwn ? "justify-end" : "justify-start",
         isHighlighted && "rounded-lg bg-yellow-100/70 py-2"
       )}
     >
-      <div className={clsx("flex max-w-[90%] items-end gap-2 sm:max-w-[78%]", isOwn && "flex-row-reverse")}>
+      <div className={clsx("flex max-w-[94%] items-end gap-1 sm:max-w-[78%] sm:gap-2", isOwn && "flex-row-reverse")}>
         <div className={clsx("flex min-w-0 flex-col gap-1", isOwn ? "items-end" : "items-start")}>
           {showMeta ? (
             <div className={clsx("flex items-center gap-2 text-xs text-slate-500", isOwn && "flex-row-reverse")}>
@@ -264,8 +265,8 @@ function MessageBubbleComponent({
 
           <div
             className={clsx(
-              "rounded-lg px-3 py-2 shadow-sm",
-              isOwn ? "bg-brand text-white" : "bg-white text-ink",
+              "rounded-lg px-3.5 py-2.5 text-[15px] leading-6",
+              isOwn && !isImageOnly ? "bg-brand text-white" : "border border-line/70 bg-white text-ink",
               message.clientStatus === "sending" && showSendingStatus && "opacity-75",
               message.clientStatus === "failed" && "border border-red-200 bg-red-50 text-red-700",
               isRecalled && "border border-dashed border-slate-300 bg-transparent text-slate-500 shadow-none"
@@ -277,7 +278,7 @@ function MessageBubbleComponent({
                 onClick={() => onQuoteClick(message.replyTo?.id ?? "")}
                 className={clsx(
                   "mb-2 flex w-full min-w-0 items-center gap-2 rounded-md border-l-4 px-2 py-2 text-left text-sm transition",
-                  isOwn
+                  isOwn && !isImageOnly
                     ? "border-white/70 bg-white/15 text-white hover:bg-white/20"
                     : "border-brand bg-slate-50 text-slate-600 hover:bg-slate-100"
                 )}
@@ -301,7 +302,7 @@ function MessageBubbleComponent({
 
             <MessageImageGallery
               imageUrls={imageUrls}
-              isOwn={isOwn}
+              isOwn={isOwn && !isImageOnly}
               senderLabel={isOwn ? "你" : SENDER_LABEL[message.sender]}
               onOpenImages={onOpenImages}
             />
@@ -364,6 +365,7 @@ function MessageBubbleComponent({
               }}
               className="inline-flex h-9 w-9 items-center justify-center rounded-md text-slate-500 transition hover:bg-white hover:text-slate-800"
               aria-label="訊息操作"
+              aria-expanded={isMenuOpen}
             >
               <MoreHorizontal size={15} />
             </button>

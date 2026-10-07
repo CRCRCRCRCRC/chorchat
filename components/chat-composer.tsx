@@ -102,8 +102,8 @@ export function ChatComposer({
   }
 
   return (
-    <footer className="border-t border-line bg-white px-3 py-3 sm:px-5">
-      <div className="mx-auto max-w-5xl">
+    <footer className="shrink-0 border-t border-line bg-white px-3 pb-[max(12px,env(safe-area-inset-bottom))] pt-3 sm:px-8 sm:pt-4 lg:px-12 xl:px-20">
+      <div className="mx-auto w-full">
         {replyTo ? (
           <div className="mb-2 flex items-center justify-between gap-3 rounded-lg border border-line bg-slate-50 px-3 py-2">
             <div className="min-w-0 text-sm">
@@ -209,7 +209,7 @@ export function ChatComposer({
             type="button"
             disabled={Boolean(editing) || isSending}
             onClick={() => fileInputRef.current?.click()}
-            className="inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-md border border-line text-slate-700 transition hover:border-slate-300 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+            className="inline-flex h-11 w-10 shrink-0 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-50 hover:text-brand disabled:cursor-not-allowed disabled:opacity-50"
             aria-label="上傳圖片"
           >
             <ImagePlus size={20} />
@@ -237,9 +237,9 @@ export function ChatComposer({
             }}
             rows={1}
             placeholder={editing ? "修改訊息內容" : "輸入訊息"}
-            className="max-h-36 min-h-11 flex-1 resize-none rounded-lg border border-line bg-slate-50 px-4 py-3 text-base leading-5 outline-none transition placeholder:text-slate-400 focus:border-brand focus:bg-white focus:ring-4 focus:ring-brand/10"
+            className="max-h-36 min-h-11 min-w-0 flex-1 resize-none rounded-lg border border-transparent bg-slate-100/80 px-4 py-3 text-base leading-5 outline-none transition placeholder:text-slate-400 focus:border-blue-200 focus:bg-white focus:ring-2 focus:ring-brand/10"
             onKeyDown={(event) => {
-              if (event.key === "Enter" && !event.shiftKey) {
+              if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
                 event.preventDefault();
                 event.currentTarget.form?.requestSubmit();
               }
@@ -249,7 +249,7 @@ export function ChatComposer({
           <button
             type="submit"
             disabled={!canSubmit}
-            className="inline-flex h-11 min-w-11 shrink-0 items-center justify-center rounded-md bg-brand px-4 font-semibold text-white transition hover:bg-blue-600 disabled:cursor-not-allowed disabled:bg-slate-300"
+            className="inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-lg bg-brand font-semibold text-white transition hover:bg-blue-600 disabled:cursor-not-allowed disabled:bg-slate-100 disabled:text-slate-400"
             aria-label={editing ? "儲存編輯" : "送出訊息"}
           >
             {isSending ? "..." : <Send size={18} />}

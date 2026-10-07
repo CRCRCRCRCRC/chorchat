@@ -17,10 +17,14 @@ body {
 
 body {
   margin: 0;
-  background: #f7f7fb;
-  color: #111827;
+  background: #f6f7f9;
+  color: #20242b;
+  letter-spacing: 0;
   font-family:
     Inter,
+    "PingFang TC",
+    "Microsoft JhengHei",
+    "Noto Sans TC",
     ui-sans-serif,
     system-ui,
     -apple-system,
@@ -37,6 +41,19 @@ textarea {
 
 button {
   touch-action: manipulation;
+}
+
+:focus-visible {
+  outline: 2px solid #176bfa;
+  outline-offset: 3px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+  }
 }
 
 ::selection {

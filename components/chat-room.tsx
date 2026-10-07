@@ -1,17 +1,30 @@
 "use client";
 
-import { ArrowDown, ArrowDownToLine, ArrowLeft, Images, Pin, RefreshCw, Search } from "lucide-react";
+import { ArrowDown, MessageCircle } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ChatComposer, type ComposerPayload } from "@/components/chat-composer";
 import { ChatToolsDialog, type ChatToolMode } from "@/components/chat-tools-dialog";
-import { ConnectionDiagnostics, type ReceiveDiagnostic, type SendDiagnostic } from "@/components/connection-diagnostics";
+import { ChatHeader, ChatSidebar } from "@/components/chat-chrome";
+import { ChatTimeline, type TimelineEntry } from "@/components/chat-timeline";
+import {
+  ConnectionDiagnostics,
+  type ReceiveDiagnostic,
+  type SendDiagnostic
+} from "@/components/connection-diagnostics";
 import { ImageLightbox } from "@/components/image-lightbox";
-import { MessageBubble } from "@/components/message-bubble";
-import { VoiceCall } from "@/components/voice-call";
+import { VoiceCall, type VoiceCallHandle } from "@/components/voice-call";
+import { useCallHistory } from "@/lib/call-history-client";
+import type { CallHistoryRecord } from "@/lib/call";
+import { firstUnreadIdentity, unreadBoundary } from "@/lib/unread";
 import { unlockAudio } from "@/lib/audio-client";
 import { clearBrowserUnreadBadge, updateBrowserUnreadBadge } from "@/lib/browser-badge";
 import { formatPresence, usePresence } from "@/lib/presence-client";
-import { acquireRealtimeChannel, isRealtimeSubscribed, reconnectRealtime, triggerRealtimeClientEvent } from "@/lib/pusher-client";
+import {
+  acquireRealtimeChannel,
+  isRealtimeSubscribed,
+  reconnectRealtime,
+  triggerRealtimeClientEvent
+} from "@/lib/pusher-client";
 import { monitorRealtimeHealth, type RealtimeHealth } from "@/lib/realtime-health-client";
 import { mergeLoadedMessages, mergeRealtimeMessages, messageIdentity } from "@/lib/message-sync";
 import { useMessageNotificationSound } from "@/lib/message-notification-client";
@@ -21,11 +34,11 @@ import {
   PUSHER_EVENT_CLIENT_MESSAGE_PREVIEW,
   PUSHER_EVENT_MESSAGES_CHANGED,
   PUSHER_EVENT_TYPING_CHANGED,
+  PUSHER_EVENT_CALLS_CHANGED,
   type ClientMessageFailedEvent,
   type ClientMessagePreviewEvent,
   type MessagesChangedEvent
 } from "@/lib/realtime";
-import { getMessageMinuteKey } from "@/lib/time";
 import { OTHER_SENDER, SENDER_LABEL, type Message, type Sender } from "@/lib/types";
 
 type ChatRoomProps = {
@@ -190,12 +203,22 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
   const [unreadCount, setUnreadCount] = useState(0);
   const [unreadBelowCount, setUnreadBelowCount] = useState(0);
   const [isAwayFromBottom, setIsAwayFromBottom] = useState(false);
+  const [unreadAnchor, setUnreadAnchor] = useState<string | null>(null);
+  const voiceCallRef = useRef<VoiceCallHandle | null>(null);
+  const cancelInitialScrollRef = useRef<(() => void) | null>(null);
+  const pendingUnreadScrollRef = useRef(false);
+  const initialHistoryInterruptedRef = useRef(false);
+  const initialCallsPositionedRef = useRef(false);
   const [activeTool, setActiveTool] = useState<ChatToolMode | null>(null);
   const [autoScrollOnIncoming, setAutoScrollOnIncoming] = useState(false);
   const [realtimeStatus, setRealtimeStatus] = useState<"connecting" | "ready" | "fallback">("connecting");
   const [realtimeAttempt, setRealtimeAttempt] = useState(0);
   const [relayError, setRelayError] = useState(false);
-  const [realtimeHealth, setRealtimeHealth] = useState<RealtimeHealth>({ state: "checking", reason: null, roundTripMs: null });
+  const [realtimeHealth, setRealtimeHealth] = useState<RealtimeHealth>({
+    state: "checking",
+    reason: null,
+    roundTripMs: null
+  });
   const [receivedDiagnostic, setReceivedDiagnostic] = useState<ReceiveDiagnostic | null>(null);
   const [sentDiagnostic, setSentDiagnostic] = useState<SendDiagnostic | null>(null);
   const pendingReceiveRef = useRef<{ source: ReceiveDiagnostic["source"]; at: number } | null>(null);
@@ -222,6 +245,17 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
   const otherSender = OTHER_SENDER[sender];
   const otherPresence = usePresence(sender, otherSender);
   const notifyMessage = useMessageNotificationSound();
+  const callHistory = useCallHistory();
+  const { mergeRecord, refresh: refreshCalls } = callHistory;
+  const boundary = useMemo(() => unreadBoundary(messages, sender, unreadAnchor), [messages, sender, unreadAnchor]);
+  const timeline = useMemo<TimelineEntry[]>(
+    () =>
+      [
+        ...messages.map((message): TimelineEntry => ({ kind: "message", message, at: message.createdAt })),
+        ...callHistory.calls.map((call): TimelineEntry => ({ kind: "call", call, at: call.startedAt }))
+      ].sort((a, b) => a.at.localeCompare(b.at)),
+    [messages, callHistory.calls]
+  );
   const pinnedMessageCount = useMemo(
     () => messages.filter((message) => message.pinnedAt && !message.recalledAt && !message.clientStatus).length,
     [messages]
@@ -246,13 +280,15 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
   }
 
   const trackReceivedMessages = useCallback((incoming: Message[], source: "client" | "server" | "poll") => {
-    const newMessage = incoming.find((message) =>
-      !knownMessageIdsRef.current.has(messageIdentity(message)) &&
-      !locallySentIdsRef.current.has(messageIdentity(message)) && !message.recalledAt
+    const newMessage = incoming.find(
+      (message) =>
+        !knownMessageIdsRef.current.has(messageIdentity(message)) &&
+        !locallySentIdsRef.current.has(messageIdentity(message)) &&
+        !message.recalledAt
     );
     if (!newMessage) return;
     pendingReceiveRef.current ??= {
-      source: source === "server" ? newMessage.clientStatus ? "server-preview" : "server-stored" : source,
+      source: source === "server" ? (newMessage.clientStatus ? "server-preview" : "server-stored") : source,
       at: performance.now()
     };
     if (source === "poll") checkRealtimeRef.current?.();
@@ -275,6 +311,8 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
 
       const data = (await response.json()) as { messages: Message[] };
       if (!hasInitializedMessageTrackingRef.current) {
+        const firstUnread = firstUnreadIdentity(data.messages, sender);
+        if (firstUnread) setUnreadAnchor(firstUnread);
         data.messages.forEach((message) => knownMessageIdsRef.current.add(messageIdentity(message)));
         hasInitializedMessageTrackingRef.current = true;
       } else {
@@ -292,7 +330,7 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
         loadMessagesPromiseRef.current = null;
       }
     }
-  }, [trackReceivedMessages]);
+  }, [sender, trackReceivedMessages]);
 
   useEffect(() => {
     let isMounted = true;
@@ -433,10 +471,12 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
         while (failedPreviewIdsRef.current.size > 500) {
           failedPreviewIdsRef.current.delete(failedPreviewIdsRef.current.values().next().value!);
         }
-        setMessages((current) => current.flatMap((message) => {
-          if (!failedClientIds.has(message.id)) return [message];
-          return message.sender === sender ? [{ ...message, clientStatus: "failed" as const }] : [];
-        }));
+        setMessages((current) =>
+          current.flatMap((message) => {
+            if (!failedClientIds.has(message.id)) return [message];
+            return message.sender === sender ? [{ ...message, clientStatus: "failed" as const }] : [];
+          })
+        );
       };
       const handleMessagesChanged = (event: MessagesChangedEvent) => {
         if (event.type === "failed") {
@@ -455,14 +495,15 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
           return;
         }
 
-        const realtimeMessages = (event.messages ?? (event.message ? [event.message] : []))
-          .filter((message) => !message.clientStatus || !failedPreviewIdsRef.current.has(message.id));
+        const realtimeMessages = (event.messages ?? (event.message ? [event.message] : [])).filter(
+          (message) => !message.clientStatus || !failedPreviewIdsRef.current.has(message.id)
+        );
 
         if (realtimeMessages.length > 0) {
           if (event.type === "created") {
             // Multiple devices can use the same identity; only suppress this tab's own preview.
-            const incomingMessages = realtimeMessages.filter((message) =>
-              !locallySentIdsRef.current.has(messageIdentity(message)) || !message.clientStatus
+            const incomingMessages = realtimeMessages.filter(
+              (message) => !locallySentIdsRef.current.has(messageIdentity(message)) || !message.clientStatus
             );
 
             if (incomingMessages.length > 0) {
@@ -500,8 +541,9 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
         }
       };
       const handleClientMessagePreview = (event: ClientMessagePreviewEvent) => {
-        const incomingMessages = event.messages.filter((message) =>
-          !locallySentIdsRef.current.has(messageIdentity(message)) && !failedPreviewIdsRef.current.has(message.id)
+        const incomingMessages = event.messages.filter(
+          (message) =>
+            !locallySentIdsRef.current.has(messageIdentity(message)) && !failedPreviewIdsRef.current.has(message.id)
         );
 
         if (incomingMessages.length > 0) {
@@ -512,6 +554,7 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
       const handleClientMessageFailed = (event: ClientMessageFailedEvent) => {
         handleFailedIds(event.clientIds);
       };
+      const handleCallChanged = (event: { record: CallHistoryRecord }) => mergeRecord(event.record);
 
       pusher.connection.bind("state_change", handleStateChange);
       channel.bind("pusher:subscription_succeeded", handleStateChange);
@@ -520,6 +563,7 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
       channel.bind(PUSHER_EVENT_TYPING_CHANGED, handleTypingChanged);
       channel.bind(PUSHER_EVENT_CLIENT_MESSAGE_PREVIEW, handleClientMessagePreview);
       channel.bind(PUSHER_EVENT_CLIENT_MESSAGE_FAILED, handleClientMessageFailed);
+      channel.bind(PUSHER_EVENT_CALLS_CHANGED, handleCallChanged);
       handleStateChange();
       if (pusher.connection.state === "connected" && !channel.subscribed && !channel.subscriptionPending) {
         channel.subscribe();
@@ -529,7 +573,9 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
         const wasConnected = realtimeConnectedRef.current;
         realtimeConnectedRef.current = health.state === "healthy" && isRealtimeSubscribed(realtimeLease);
         setRealtimeHealth(health);
-        setRealtimeStatus(health.state === "healthy" ? "ready" : health.state === "checking" ? "connecting" : "fallback");
+        setRealtimeStatus(
+          health.state === "healthy" ? "ready" : health.state === "checking" ? "connecting" : "fallback"
+        );
         if (wasConnected !== realtimeConnectedRef.current) schedulePoll(0);
       });
       checkRealtimeRef.current = healthMonitor.check;
@@ -548,6 +594,7 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
         channel.unbind(PUSHER_EVENT_TYPING_CHANGED, handleTypingChanged);
         channel.unbind(PUSHER_EVENT_CLIENT_MESSAGE_PREVIEW, handleClientMessagePreview);
         channel.unbind(PUSHER_EVENT_CLIENT_MESSAGE_FAILED, handleClientMessageFailed);
+        channel.unbind(PUSHER_EVENT_CALLS_CHANGED, handleCallChanged);
         realtimeLease.release();
       };
     });
@@ -559,7 +606,7 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
       window.clearTimeout(retryTimer);
       cleanupChannel?.();
     };
-  }, [loadMessages, sender, realtimeAttempt, trackReceivedMessages]);
+  }, [loadMessages, sender, realtimeAttempt, trackReceivedMessages, mergeRecord]);
 
   useEffect(() => {
     const optimisticImageUrls = optimisticImageUrlsRef.current;
@@ -597,6 +644,12 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
       programmaticScrollTimerRef.current = null;
     }
   }, []);
+
+  const cancelInitialPositioning = useCallback(() => {
+    initialHistoryInterruptedRef.current = true;
+    cancelInitialScrollRef.current?.();
+    stopProgrammaticScrollTracking();
+  }, [stopProgrammaticScrollTracking]);
 
   const startProgrammaticScrollTracking = useCallback(
     (timeoutMs: number) => {
@@ -659,13 +712,14 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
   }, [clearUnreadBelow, stopProgrammaticScrollTracking]);
 
   useLayoutEffect(() => {
-    latestRenderedMessageIdRef.current = messages.at(-1)?.id ?? null;
+    const last = timeline.at(-1);
+    latestRenderedMessageIdRef.current = last ? (last.kind === "call" ? last.call.id : last.message.id) : null;
     if (pendingReceiveRef.current) {
       const { source, at } = pendingReceiveRef.current;
       pendingReceiveRef.current = null;
       setReceivedDiagnostic({ source, renderMs: Math.round(performance.now() - at) });
     }
-  }, [messages]);
+  }, [messages, timeline]);
 
   useLayoutEffect(() => {
     if (isLoading || hasInitialScrolledRef.current) {
@@ -680,6 +734,7 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
       isSettling = false;
       mutationObserver.disconnect();
     };
+    cancelInitialScrollRef.current = stopInitialSettling;
     const jumpToBottom = () => {
       if (!isSettling) return;
       if (latestRenderedMessageIdRef.current !== initialLatestMessageId) {
@@ -706,6 +761,7 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
     const observerTimer = window.setTimeout(stopInitialSettling, 1500);
 
     return () => {
+      cancelInitialScrollRef.current = null;
       mutationObserver.disconnect();
       scrollContainer?.removeEventListener("wheel", stopInitialSettling);
       scrollContainer?.removeEventListener("touchstart", stopInitialSettling);
@@ -750,6 +806,7 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
     const knownMessageIds = knownMessageIdsRef.current;
     let newIncomingMessageCount = 0;
     let newSyncedOwnMessageCount = 0;
+    let firstIncoming: string | null = null;
 
     visibleMessages.forEach((message) => {
       if (knownMessageIds.has(messageIdentity(message))) {
@@ -759,6 +816,7 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
       knownMessageIds.add(messageIdentity(message));
 
       if (message.sender !== sender && !message.recalledAt) {
+        firstIncoming ??= messageIdentity(message);
         newIncomingMessageCount += 1;
       } else if (!locallySentIdsRef.current.has(messageIdentity(message)) && !message.recalledAt) {
         newSyncedOwnMessageCount += 1;
@@ -767,13 +825,17 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
 
     if (newIncomingMessageCount === 0) {
       if (newSyncedOwnMessageCount > 0) {
+        initialHistoryInterruptedRef.current = true;
         if (autoScrollOnIncoming) scrollToLatest("instant");
         else setIsAwayFromBottom(true);
       }
       return;
     }
+    initialHistoryInterruptedRef.current = true;
+    if (firstIncoming) setUnreadAnchor((current) => current ?? firstIncoming);
 
     if (autoScrollOnIncoming) {
+      pendingUnreadScrollRef.current = true;
       scrollToLatest("instant");
     } else {
       const scrollContainer = chatScrollRef.current;
@@ -800,6 +862,20 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
     sender,
     stopProgrammaticScrollTracking
   ]);
+
+  useLayoutEffect(() => {
+    if (autoScrollOnIncoming && boundary && pendingUnreadScrollRef.current) {
+      pendingUnreadScrollRef.current = false;
+      scrollToLatest("instant");
+    }
+  }, [autoScrollOnIncoming, boundary, scrollToLatest]);
+
+  useLayoutEffect(() => {
+    if (isLoading || callHistory.loading || initialCallsPositionedRef.current) return;
+    initialCallsPositionedRef.current = true;
+    // Call history may arrive after messages; never undo a user's navigation.
+    if (!initialHistoryInterruptedRef.current) scrollToLatest("instant");
+  }, [callHistory.loading, isLoading, scrollToLatest]);
 
   useEffect(() => {
     if (!isPageActive || isAwayFromBottom || unreadBelowCountRef.current > 0) {
@@ -850,6 +926,7 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
   }, [isAwayFromBottom, isPageActive, loadMessages, messages, sender]);
 
   function focusMessage(messageId: string) {
+    cancelInitialPositioning();
     document.getElementById(`message-${messageId}`)?.scrollIntoView({
       behavior: "smooth",
       block: "center"
@@ -876,26 +953,30 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
     return data.url;
   }
 
-  async function persistOptimisticMessage(
-    tempId: string,
-    requestBody: CreateMessageRequest,
-    localImageCount = 0
-  ) {
+  async function persistOptimisticMessage(tempId: string, requestBody: CreateMessageRequest, localImageCount = 0) {
     // Publish independently: neither DB startup nor an unrelated Pusher setting may gate delivery.
     const startedAt = performance.now();
     setSentDiagnostic({ id: tempId, relayMs: null, saveMs: null, relayFailed: false });
     const recordRelay = (ok: boolean) => {
       setRelayError(!ok);
-      setSentDiagnostic((current) => current?.id === tempId ? {
-        ...current, relayMs: Math.round(performance.now() - startedAt), relayFailed: !ok
-      } : current);
+      setSentDiagnostic((current) =>
+        current?.id === tempId
+          ? {
+              ...current,
+              relayMs: Math.round(performance.now() - startedAt),
+              relayFailed: !ok
+            }
+          : current
+      );
     };
     void fetch("/api/realtime", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(requestBody),
       signal: AbortSignal.timeout(5000)
-    }).then((response) => recordRelay(response.ok)).catch(() => recordRelay(false));
+    })
+      .then((response) => recordRelay(response.ok))
+      .catch(() => recordRelay(false));
 
     const response = await fetch("/api/messages", {
       method: "POST",
@@ -910,9 +991,14 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
     }
 
     const data = (await response.json()) as { message: Message };
-    setSentDiagnostic((current) => current?.id === tempId ? {
-      ...current, saveMs: Math.round(performance.now() - startedAt)
-    } : current);
+    setSentDiagnostic((current) =>
+      current?.id === tempId
+        ? {
+            ...current,
+            saveMs: Math.round(performance.now() - startedAt)
+          }
+        : current
+    );
 
     for (let index = 0; index < localImageCount; index += 1) {
       const optimisticImageUrl = optimisticImageUrlsRef.current.get(`${tempId}-${index}`);
@@ -923,9 +1009,7 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
       }
     }
 
-    setMessages((currentMessages) =>
-      mergeRealtimeMessages(currentMessages, [data.message], [tempId])
-    );
+    setMessages((currentMessages) => mergeRealtimeMessages(currentMessages, [data.message], [tempId]));
   }
 
   function markOptimisticMessageFailed(tempId: string) {
@@ -1156,7 +1240,7 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
               readAt: null,
               pinnedAt: null,
               pinnedBy: null,
-              replyToMessageId: textTempId ? null : replyTarget?.id ?? null,
+              replyToMessageId: textTempId ? null : (replyTarget?.id ?? null),
               replyTo: textTempId ? null : replyTarget ? toReplyMessage(replyTarget) : null,
               reactions: [],
               clientStatus: "sending"
@@ -1300,94 +1384,36 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
     setEditing(message);
   }
 
-  return (
-    <main className="flex h-dvh flex-col bg-paper text-ink">
-      {realtimeStatus !== "ready" || relayError ? (
-        <div role="status" className="flex shrink-0 items-center justify-center gap-3 bg-amber-50 px-3 py-1 text-xs text-amber-900">
-          <span>{relayError ? "即時傳送暫時失敗，訊息仍會儲存並同步" : realtimeStatus === "connecting" ? "正在連接聊天室…" : "即時連線中斷，正在重新連線"}</span>
-          <button type="button" className="shrink-0 underline" onClick={handleReconnect}>重新連線</button>
-        </div>
-      ) : null}
-      <header className="border-b border-line bg-white/95 backdrop-blur">
-        <div className="mx-auto flex max-w-5xl items-center justify-between gap-3 px-4 py-3">
-          <button
-            type="button"
-            onClick={onSwitchIdentity}
-            className="inline-flex h-10 items-center gap-2 rounded-md border border-line px-3 text-sm font-medium text-slate-700 transition hover:border-slate-300 hover:bg-slate-50 focus:outline-none focus:ring-4 focus:ring-brand/20"
-          >
-            <ArrowLeft size={17} />
-            換身分
-          </button>
+  function redial() {
+    setActiveTool(null);
+    void unlockAudio();
+    void voiceCallRef.current?.startCall();
+  }
 
-          <div className="min-w-0 text-center">
-            <h1 className="truncate text-lg font-semibold">chorchat</h1>
-            <p className="flex items-center justify-center gap-1.5 truncate text-xs text-slate-500">
-              <span
-                className={`h-2 w-2 shrink-0 rounded-full ${otherPresence.isOnline ? "bg-emerald-500" : "bg-slate-300"}`}
-              />
-              <span className="truncate">
-                {SENDER_LABEL[otherSender]} · {formatPresence(otherPresence)}
-              </span>
-            </p>
-          </div>
-
-          <div className="flex items-center gap-2">
-            <VoiceCall sender={sender} recipient={otherSender} />
-            <button
-              type="button"
-              onClick={() => void loadMessages()}
-              className="inline-flex h-10 w-10 items-center justify-center rounded-md border border-line text-slate-700 transition hover:border-slate-300 hover:bg-slate-50 focus:outline-none focus:ring-4 focus:ring-brand/20"
-              aria-label="重新整理"
-            >
-              <RefreshCw size={17} />
-            </button>
-          </div>
-        </div>
-        <nav className="border-t border-line/80 px-3 py-2" aria-label="聊天室工具">
-          <div className="mx-auto grid max-w-5xl grid-cols-4 gap-1 sm:gap-2">
-            <button
-              type="button"
-              onClick={() => setActiveTool("search")}
-              className="inline-flex h-9 items-center justify-center gap-2 rounded-md text-sm font-medium text-slate-600 hover:bg-slate-100 hover:text-ink"
-            >
-              <Search size={16} />搜尋
-            </button>
-            <button
-              type="button"
-              onClick={() => setActiveTool("media")}
-              className="inline-flex h-9 items-center justify-center gap-2 rounded-md text-sm font-medium text-slate-600 hover:bg-slate-100 hover:text-ink"
-            >
-              <Images size={16} />媒體
-            </button>
-            <button
-              type="button"
-              onClick={() => setActiveTool("pinned")}
-              className="inline-flex h-9 items-center justify-center gap-2 rounded-md text-sm font-medium text-slate-600 hover:bg-slate-100 hover:text-ink"
-            >
-              <Pin size={16} />置頂
-              {pinnedMessageCount > 0 ? (
-                <span className="inline-flex min-w-5 items-center justify-center rounded-md bg-blue-50 px-1 text-xs text-brand">
-                  {pinnedMessageCount}
-                </span>
-              ) : null}
-            </button>
-            <button
-              type="button"
-              onClick={toggleAutoScrollOnIncoming}
-              aria-pressed={autoScrollOnIncoming}
-              aria-label={`新訊息自動滑到底：${autoScrollOnIncoming ? "已開啟" : "已關閉"}`}
-              className={`inline-flex h-9 items-center justify-center gap-1.5 rounded-md text-sm font-medium transition ${
-                autoScrollOnIncoming
-                  ? "bg-blue-50 text-brand"
-                  : "text-slate-600 hover:bg-slate-100 hover:text-ink"
-              }`}
-            >
-              <ArrowDownToLine size={16} />自動{autoScrollOnIncoming ? "開" : "關"}
-            </button>
-          </div>
-        </nav>
-      </header>
-
+  const chromeProps = {
+    sender,
+    otherSender,
+    presence: formatPresence(otherPresence),
+    online: otherPresence.isOnline,
+    pinnedCount: pinnedMessageCount,
+    autoScroll: autoScrollOnIncoming,
+    onToggleAutoScroll: toggleAutoScrollOnIncoming,
+    onOpenTool: setActiveTool,
+    onSwitchIdentity,
+    onRefresh: () => {
+      void loadMessages();
+      void refreshCalls();
+    },
+    voiceCall: (
+      <VoiceCall
+        ref={voiceCallRef}
+        sender={sender}
+        recipient={otherSender}
+        onRecord={mergeRecord}
+        onHistoryChanged={refreshCalls}
+      />
+    ),
+    diagnostics: (
       <ConnectionDiagnostics
         health={realtimeHealth}
         received={receivedDiagnostic}
@@ -1395,110 +1421,150 @@ export function ChatRoom({ sender, onSwitchIdentity }: ChatRoomProps) {
         onCheck={() => checkRealtimeRef.current?.()}
         onReconnect={handleReconnect}
       />
+    )
+  };
 
-      <section
-        ref={chatScrollRef}
-        onScroll={handleChatScroll}
-        onWheel={stopProgrammaticScrollTracking}
-        onTouchStart={stopProgrammaticScrollTracking}
-        onPointerDown={(event) => {
-          if (event.target === event.currentTarget) {
-            stopProgrammaticScrollTracking();
-          }
-        }}
-        className="chat-scrollbar mx-auto flex min-h-0 w-full max-w-5xl flex-1 flex-col gap-4 overflow-y-auto px-3 py-5 sm:px-5"
-      >
-        {isLoading && messages.length === 0 ? (
-          <div className="flex flex-1 items-center justify-center">
-            <div className="h-10 w-10 animate-spin rounded-full border-2 border-line border-t-brand" />
-          </div>
-        ) : messages.length === 0 ? (
-          <div className="flex flex-1 items-center justify-center text-center text-sm leading-7 text-slate-500">
-            還沒有訊息。傳送第一則文字或圖片開始對話。
-          </div>
-        ) : (
-          messages.map((message, index) => {
-            const previousMessage = messages[index - 1];
-            const showTimestamp =
-              !previousMessage || getMessageMinuteKey(previousMessage.createdAt) !== getMessageMinuteKey(message.createdAt);
-
-            return (
-              <MessageBubble
-                key={message.id}
-                message={message}
-                currentSender={sender}
-                isHighlighted={highlightedId === message.id}
-                showTimestamp={showTimestamp}
-                readReceipt={
-                  message.id === latestOwnReadableMessageId && message.sender === sender
-                    ? message.readAt
-                      ? "read"
-                      : "unread"
-                    : null
-                }
-                onReply={() => {
-                  setEditing(null);
-                  setReplyTo(message);
-                }}
-                onEdit={() => handleStartEdit(message)}
-                onRecall={() => void handleRecall(message)}
-                onTogglePin={() => void handleTogglePin(message)}
-                onToggleReaction={(emoji) => void handleToggleReaction(message, emoji)}
-                onOpenImages={(urls, index = 0) => setLightboxImages({ urls, index })}
-                onQuoteClick={focusMessage}
-              />
-            );
-          })
-        )}
-        {isOtherTyping ? (
-          <div className="flex justify-start px-1 text-sm text-slate-500">
-            {SENDER_LABEL[otherSender]} 正在輸入...
+  return (
+    <main className="flex h-dvh overflow-hidden bg-paper text-ink">
+      <ChatSidebar {...chromeProps} />
+      <div className="relative flex min-w-0 flex-1 flex-col">
+        {realtimeStatus !== "ready" || relayError ? (
+          <div
+            role="status"
+            className="flex shrink-0 items-center justify-center gap-3 bg-amber-50 px-3 py-1 text-xs text-amber-900"
+          >
+            <span>
+              {relayError
+                ? "即時傳送暫時失敗，訊息仍會儲存並同步"
+                : realtimeStatus === "connecting"
+                  ? "正在連接聊天室…"
+                  : "即時連線中斷，正在重新連線"}
+            </span>
+            <button type="button" className="shrink-0 underline" onClick={handleReconnect}>
+              重新連線
+            </button>
           </div>
         ) : null}
-      </section>
+        <ChatHeader {...chromeProps} />
+        {boundary ? (
+          <div className="flex shrink-0 items-center justify-center gap-2 border-b border-blue-100 bg-blue-50/70 px-3 py-2 text-xs text-brand">
+            <span>{boundary.count} 則新訊息</span>
+            <button
+              type="button"
+              className="font-medium underline underline-offset-2"
+              onClick={() => {
+                cancelInitialPositioning();
+                document.getElementById("unread-divider")?.scrollIntoView({ behavior: "smooth", block: "center" });
+              }}
+            >
+              查看第一則
+            </button>
+          </div>
+        ) : null}
 
-      {isAwayFromBottom || unreadBelowCount > 0 ? (
-        <button
-          type="button"
-          onClick={() => scrollToLatest("smooth")}
-          className="fixed bottom-24 left-1/2 z-30 inline-flex h-10 -translate-x-1/2 items-center gap-2 rounded-md border border-line bg-white px-3 text-sm font-semibold text-slate-700 shadow-soft transition hover:border-brand hover:text-brand focus:outline-none focus:ring-4 focus:ring-brand/20"
-          aria-label={unreadBelowCount > 0 ? `${unreadBelowCount} 則未讀訊息，回到最新訊息` : "回到最新訊息"}
+        <section
+          ref={chatScrollRef}
+          onScroll={handleChatScroll}
+          onWheel={cancelInitialPositioning}
+          onTouchStart={cancelInitialPositioning}
+          onKeyDown={(event) => {
+            if (["ArrowUp", "PageUp", "Home"].includes(event.key)) cancelInitialPositioning();
+          }}
+          onPointerDown={(event) => {
+            if (event.target === event.currentTarget) {
+              cancelInitialPositioning();
+            }
+          }}
+          className="chat-scrollbar flex min-h-0 w-full flex-1 flex-col gap-3 overflow-y-auto px-3 py-5 sm:px-8 lg:px-12 xl:px-20"
         >
-          <ArrowDown size={16} />
-          {unreadBelowCount > 0 ? `${unreadBelowCount} 則未讀訊息` : "回到最新訊息"}
-        </button>
-      ) : null}
+          {isLoading && messages.length === 0 ? (
+            <div className="flex flex-1 items-center justify-center">
+              <div className="h-10 w-10 animate-spin rounded-full border-2 border-line border-t-brand" />
+            </div>
+          ) : timeline.length === 0 ? (
+            <div className="flex flex-1 flex-col items-center justify-center gap-4 text-center text-sm leading-7 text-slate-400">
+              <span className="flex h-16 w-16 items-center justify-center rounded-lg bg-white text-brand">
+                <MessageCircle size={28} strokeWidth={1.5} />
+              </span>
+              <span>還沒有訊息。傳送第一則文字或圖片開始對話。</span>
+            </div>
+          ) : (
+            <ChatTimeline
+              entries={timeline}
+              sender={sender}
+              highlightedId={highlightedId}
+              latestOwnId={latestOwnReadableMessageId}
+              boundary={boundary}
+              onReply={(message) => {
+                setEditing(null);
+                setReplyTo(message);
+              }}
+              onEdit={handleStartEdit}
+              onRecall={(message) => void handleRecall(message)}
+              onPin={(message) => void handleTogglePin(message)}
+              onReaction={(message, emoji) => void handleToggleReaction(message, emoji)}
+              onOpenImages={(urls, index = 0) => setLightboxImages({ urls, index })}
+              onQuote={focusMessage}
+              onRedial={redial}
+            />
+          )}
+          {isOtherTyping ? (
+            <div className="flex justify-start px-1 text-sm text-slate-500">
+              {SENDER_LABEL[otherSender]} 正在輸入...
+            </div>
+          ) : null}
+        </section>
 
-      {error ? (
-        <div className="border-t border-red-100 bg-red-50 px-4 py-2 text-center text-sm text-red-700">{error}</div>
-      ) : null}
+        {isAwayFromBottom || unreadBelowCount > 0 ? (
+          <button
+            type="button"
+            onClick={() => scrollToLatest("smooth")}
+            className="absolute bottom-24 left-1/2 z-20 inline-flex h-10 -translate-x-1/2 items-center gap-2 whitespace-nowrap rounded-lg border border-line bg-white px-4 text-xs font-semibold text-slate-700 shadow-soft transition hover:border-brand hover:text-brand focus:outline-none focus:ring-4 focus:ring-brand/20"
+            aria-label={unreadBelowCount > 0 ? `${unreadBelowCount} 則未讀訊息，回到最新訊息` : "回到最新訊息"}
+          >
+            <ArrowDown size={16} />
+            {unreadBelowCount > 0 ? `${unreadBelowCount} 則未讀訊息` : "回到最新訊息"}
+          </button>
+        ) : null}
 
-      <ChatComposer
-        isSending={isSending}
-        replyTo={replyTo}
-        editing={editing}
-        editingLabel={editingLabel}
-        onCancelReply={() => setReplyTo(null)}
-        onCancelEdit={() => setEditing(null)}
-        onTypingActivity={handleTypingActivity}
-        onSubmit={handleSubmit}
-      />
+        {error ? (
+          <div className="border-t border-red-100 bg-red-50 px-4 py-2 text-center text-sm text-red-700">{error}</div>
+        ) : null}
 
-      {activeTool ? (
-        <ChatToolsDialog
-          mode={activeTool}
-          messages={messages}
-          onClose={() => setActiveTool(null)}
-          onFocusMessage={focusMessage}
-          onOpenImages={(urls, index) => setLightboxImages({ urls, index })}
+        <ChatComposer
+          isSending={isSending}
+          replyTo={replyTo}
+          editing={editing}
+          editingLabel={editingLabel}
+          onCancelReply={() => setReplyTo(null)}
+          onCancelEdit={() => setEditing(null)}
+          onTypingActivity={handleTypingActivity}
+          onSubmit={handleSubmit}
         />
-      ) : null}
 
-      <ImageLightbox
-        imageUrls={lightboxImages?.urls ?? []}
-        initialIndex={lightboxImages?.index ?? 0}
-        onClose={() => setLightboxImages(null)}
-      />
+        {activeTool ? (
+          <ChatToolsDialog
+            mode={activeTool}
+            messages={messages}
+            calls={callHistory.calls}
+            currentSender={sender}
+            callError={callHistory.error}
+            callsLoading={callHistory.loading}
+            onRefreshCalls={() => void refreshCalls()}
+            onRedial={redial}
+            onClose={() => setActiveTool(null)}
+            onFocusMessage={focusMessage}
+            onOpenImages={(urls, index) => setLightboxImages({ urls, index })}
+          />
+        ) : null}
+
+        <ImageLightbox
+          key={lightboxImages ? lightboxImages.urls.join("|") : "closed"}
+          imageUrls={lightboxImages?.urls ?? []}
+          initialIndex={lightboxImages?.index ?? 0}
+          onClose={() => setLightboxImages(null)}
+        />
+      </div>
     </main>
   );
 }

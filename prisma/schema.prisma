@@ -71,3 +71,20 @@ model CallSignal {
   @@index([callId, createdAt])
   @@map("call_signals")
 }
+
+model CallRecord {
+  id             String    @id
+  caller         Sender
+  callee         Sender
+  status         String    @default("ringing")
+  startedAt      DateTime  @default(now()) @map("started_at")
+  answeredAt     DateTime? @map("answered_at")
+  endedAt        DateTime? @map("ended_at")
+  endedBy        Sender?   @map("ended_by")
+  lastActivityAt DateTime  @default(now()) @map("last_activity_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+
+  @@index([startedAt])
+  @@index([status, lastActivityAt])
+  @@map("call_records")
+}

@@ -1,141 +1,14 @@
-import { expect, test, type Browser, type BrowserContext, type WebSocketRoute } from "@playwright/test";
-import { storedMessageId } from "../../lib/message-identity";
-import { createProvisionalMessage, type MessageInput } from "../../lib/message-input";
-import { encodeRealtimePayload } from "../../lib/realtime-payload";
-import type { Message, Sender } from "../../lib/types";
-import { installNotificationProbe } from "./notification-probe";
-
-async function chatPair(browser: Browser, options: {
-  persistenceDelay?: number;
-  rejectSubscription?: boolean;
-  sameIdentity?: boolean;
-  initialHistoryDelayMs?: number;
-  history?: Message[];
-  dropFirstMobileConnection?: boolean;
-  failProbePublish?: boolean;
-} = {}) {
-  const sockets = new Set<WebSocketRoute>();
-  const droppedSockets = new Set<WebSocketRoute>();
-  const saved: Message[] = [...(options.history ?? [])];
-  const contexts: BrowserContext[] = [];
-  const errors: string[] = [];
-  const metrics = { persisted: 0, polls: 0, clientEvents: 0, mobileConnections: 0, probes: 0 };
-  let rejectSubscription = options.rejectSubscription ?? false;
-  const pending = new Set<Promise<void>>();
-
-  function publish(event: string, payload: Record<string, unknown>) {
-    for (const part of encodeRealtimePayload(event, payload)) {
-      for (const socket of sockets) {
-        if (!droppedSockets.has(socket)) socket.send(JSON.stringify({ event: part.name, channel: "private-chorchat-main", data: JSON.stringify(part.data) }));
-      }
-    }
-  }
-
-  async function pageFor(sender: Sender, mobile: boolean) {
-    let initialHistory = true;
-    const context = await browser.newContext({ viewport: mobile ? { width: 390, height: 844 } : { width: 1280, height: 800 }, isMobile: mobile, hasTouch: mobile });
-    contexts.push(context);
-    await context.addInitScript((identity) => localStorage.setItem("chorchat:sender", identity), sender);
-    await context.addInitScript(installNotificationProbe);
-    await context.routeWebSocket(/wss:\/\/ws-.*\.pusher\.com\//, (socket) => {
-      if (mobile) {
-        metrics.mobileConnections++;
-        if (options.dropFirstMobileConnection && metrics.mobileConnections === 1) droppedSockets.add(socket);
-      }
-      socket.send(JSON.stringify({ event: "pusher:connection_established", data: JSON.stringify({ socket_id: `${Math.random()}.1`, activity_timeout: 120 }) }));
-      socket.onMessage((raw) => {
-        const message = JSON.parse(raw.toString());
-        if (message.event === "pusher:subscribe") {
-          sockets.add(socket);
-          socket.send(JSON.stringify({ event: "pusher_internal:subscription_succeeded", channel: "private-chorchat-main", data: "{}" }));
-        } else if (message.event === "pusher:unsubscribe") sockets.delete(socket);
-        // Deliberately discard client events: server relay must work without this dashboard switch.
-        else if (message.event.startsWith("client-")) metrics.clientEvents++;
-      });
-      socket.onClose(() => sockets.delete(socket));
-    });
-    await context.route("**/api/**", async (route) => {
-      const request = route.request();
-      const path = new URL(request.url()).pathname;
-      const json = (body: unknown, status = 200) => route.fulfill({ json: body, status });
-      if (path === "/api/realtime" && request.method() === "GET") return json({ config: { key: "test-key", cluster: "ap3" } });
-      if (path === "/api/realtime/probe") {
-        metrics.probes++;
-        if (options.failProbePublish) return json({ published: false }, 503);
-        publish("connection:probe", { token: request.postDataJSON().token });
-        return json({ published: true });
-      }
-      if (path === "/api/pusher/auth") return json(rejectSubscription ? { error: "Test authorization failure" } : { auth: "test-key:test-signature" }, rejectSubscription ? 403 : 200);
-      if (path === "/api/realtime") {
-        const input = request.postDataJSON() as MessageInput;
-        publish("messages:changed", { type: "created", message: createProvisionalMessage(input) });
-        return json({ published: true });
-      }
-      if (path === "/api/messages" && request.method() === "GET") {
-        metrics.polls++;
-        const snapshot = [...saved];
-        if (mobile && initialHistory && options.initialHistoryDelayMs) {
-          initialHistory = false;
-          const task = new Promise<void>((resolve) => setTimeout(resolve, options.initialHistoryDelayMs))
-            .then(() => json({ messages: snapshot }));
-          pending.add(task);
-          try { await task; } finally { pending.delete(task); }
-          return;
-        }
-        return json({ messages: snapshot });
-      }
-      if (path === "/api/messages") {
-        const input = request.postDataJSON() as MessageInput;
-        const task = (async () => {
-          await new Promise((resolve) => setTimeout(resolve, options.persistenceDelay ?? 20));
-          const message: Message = { ...createProvisionalMessage(input)!, id: storedMessageId(input.clientId!, input.sender), clientStatus: undefined };
-          saved.push(message);
-          metrics.persisted++;
-          // Both channels may deliver the saved message; it must appear only once.
-          publish("messages:changed", { type: "created", message, clientId: input.clientId });
-          await json({ message }, 201);
-        })();
-        pending.add(task);
-        try { await task; } finally { pending.delete(task); }
-        return;
-      }
-      if (path === "/api/messages/read") return json({ marked: 0 });
-      if (path === "/api/presence") return json({ statuses: [], presence: {} });
-      if (path === "/api/call") return json({ signals: [] });
-      return json({ ok: true });
-    });
-    const page = await context.newPage();
-    page.on("pageerror", (error) => errors.push(error.message));
-    await page.goto("http://127.0.0.1:3100");
-    await expect(page.getByPlaceholder("輸入訊息")).toBeVisible();
-    if (options.history?.length) {
-      await expect(page.locator("article[id^='message-']")).toHaveCount(options.history.length);
-    } else if (!(mobile && options.initialHistoryDelayMs)) {
-      await expect(page.getByText("還沒有訊息。傳送第一則文字或圖片開始對話。")).toBeVisible();
-    }
-    return page;
-  }
-  const chen = await pageFor("CHEN", false);
-  const zuo = await pageFor(options.sameIdentity ? "CHEN" : "ZUO", true);
-  return {
-    chen, zuo, metrics, errors,
-    allowSubscription: () => { rejectSubscription = false; },
-    close: async () => {
-      await Promise.allSettled([...pending]);
-      // Keep context routes active while pages unload, including late focus requests.
-      for (const context of contexts) {
-        await Promise.all(context.pages().map((page) => page.close()));
-        await context.close();
-      }
-    }
-  };
-}
+import { expect, test } from "@playwright/test";
+import { createProvisionalMessage } from "../../lib/message-input";
+import type { Message } from "../../lib/types";
+import { chatPair } from "./chat-fixture";
 
 test("a subscribed device with a silently broken receive path reconnects and receives both directions before storage", async ({ browser }, testInfo) => {
   const pair = await chatPair(browser, { sameIdentity: true, dropFirstMobileConnection: true, persistenceDelay: 9000 });
   try {
     await expect.poll(() => pair.metrics.mobileConnections, { timeout: 7000 }).toBe(2);
     await expect(pair.zuo.getByRole("status")).toHaveCount(0);
+    await pair.zuo.getByRole("button", { name: "更多選項", exact: true }).click();
     await pair.zuo.getByText("連線檢查", { exact: true }).click();
     await expect(pair.zuo.getByText("已驗證收到推送", { exact: true })).toBeVisible();
     for (const [sending, receiving] of [[pair.chen, pair.zuo], [pair.zuo, pair.chen]]) {
@@ -145,6 +18,8 @@ test("a subscribed device with a silently broken receive path reconnects and rec
       await expect(receiving.getByText(text, { exact: true })).toBeVisible({ timeout: 1000 });
     }
     expect(pair.metrics.persisted).toBe(0);
+    await pair.zuo.getByRole("button", { name: "更多選項", exact: true }).click();
+    await pair.zuo.getByText("連線檢查", { exact: true }).click();
     await expect(pair.zuo.getByText("伺服器推送（儲存前）", { exact: true })).toBeVisible();
     await pair.zuo.screenshot({ path: testInfo.outputPath("receive-diagnostics.png") });
     expect(pair.errors).toEqual([]);
@@ -156,6 +31,7 @@ test("manual reconnect creates a new socket instead of leasing the same connecti
   try {
     await expect(pair.zuo.getByRole("status")).toHaveCount(0);
     expect(pair.metrics.mobileConnections).toBe(1);
+    await pair.zuo.getByRole("button", { name: "更多選項", exact: true }).click();
     await pair.zuo.getByText("連線檢查", { exact: true }).click();
     await pair.zuo.getByRole("button", { name: "重建連線", exact: true }).click();
     await expect.poll(() => pair.metrics.mobileConnections).toBe(2);
@@ -167,6 +43,7 @@ test("manual reconnect creates a new socket instead of leasing the same connecti
 test("probe publish failures retain polling without repeatedly disconnecting a healthy socket", async ({ browser }) => {
   const pair = await chatPair(browser, { failProbePublish: true });
   try {
+    await pair.zuo.getByRole("button", { name: "更多選項", exact: true }).click();
     await pair.zuo.getByText("連線檢查", { exact: true }).click();
     await expect(pair.zuo.getByText("探測要求失敗或逾時", { exact: true })).toBeVisible();
     const probes = pair.metrics.probes;
